@@ -1,7 +1,6 @@
 import os
 import requests
 from datetime import datetime, timedelta
-import pytz
 
 def fetch_airtable_records():
     api_key = os.environ.get("AIRTABLE_API_KEY")
@@ -18,18 +17,15 @@ def fetch_airtable_records():
         "Content-Type": "application/json"
     }
 
-    # Timezone Fix: Exact 9 AM to 9 PM logic for Asia/Karachi
-    tz = pytz.timezone('Asia/Karachi')
-    now = datetime.now(tz)
-    end_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    start_time = end_time - timedelta(days=1)
+    # Standard UTC time: 24 hours ago to now
+    now = datetime.utcnow()
+    start_time = now - timedelta(days=1)
     
     # Format dates for Airtable
     start_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    end_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    end_str = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
 
     params = {
-        # Only get records modified between 9 AM yesterday and 9 AM today
         "filterByFormula": f"AND(IS_AFTER(LAST_MODIFIED_TIME(), '{start_str}'), IS_BEFORE(LAST_MODIFIED_TIME(), '{end_str}'))",
         "sort[0][field]": "Last Modified",
         "sort[0][direction]": "desc"
@@ -38,9 +34,9 @@ def fetch_airtable_records():
     all_records = []
     offset = None
 
-    print("Fetching abandoned forms from Airtable (9 AM to 9 AM)...")
+    print("Fetching abandoned forms from Airtable...")
     
-    # Pagination Fix: Loop to fetch all records if they are more than 100
+    # Pagination loop to fetch all records
     while True:
         if offset:
             params["offset"] = offset
@@ -51,9 +47,9 @@ def fetch_airtable_records():
             data = response.json()
             records = data.get("records", [])
             all_records.extend(records)
-            offset = data.get("offset") # Check if there are more records
+            offset = data.get("offset")
             if not offset:
-                break # Exit loop when no more pages
+                break
         else:
             print(f"❌ Error fetching data: {response.status_code}")
             print(response.text)
@@ -61,7 +57,7 @@ def fetch_airtable_records():
 
     print(f"✅ Successfully fetched {len(all_records)} records.")
     
-    for record in all_records[:10]: # Print only first 10 to keep logs clean
+    for record in all_records[:10]:
         fields = record.get("fields", {})
         print(f"ID: {record.get('id')} | Name: {fields.get('Name', 'N/A')}")
 
