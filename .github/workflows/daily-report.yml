@@ -2,9 +2,9 @@ name: Daily Abandoned Forms Report
 
 on:
   schedule:
-    # Runs every day at 9:00 AM UTC (Adjust if needed for your timezone)
+    # Runs every day at 9:00 AM UTC
     - cron: '0 9 * * *'
-  workflow_dispatch: # This allows you to test it manually right now!
+  workflow_dispatch: # Allows manual testing
 
 jobs:
   fetch-and-report:
@@ -29,3 +29,9 @@ jobs:
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
         run: python main.py
+        
+      - name: Upload Data Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: abandoned-forms-data
+          path: abandoned_forms_data.json
