@@ -2,19 +2,18 @@ name: Daily Abandoned Forms Report
 
 on:
   schedule:
-    # Runs every day at 9:00 AM UTC
     - cron: '0 9 * * *'
-  workflow_dispatch: # Allows manual testing
+  workflow_dispatch:
 
 jobs:
   fetch-and-report:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4 # Updated Version
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5 # Updated Version
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
@@ -23,15 +22,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Airtable Fetch Script
+      - name: Run Data Fetch & Compare Script
         env:
           AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
           AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
           AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
+          CLARITY_API_TOKEN: ${{ secrets.CLARITY_API_TOKEN }}
+          CLARITY_BASE_URLS: ${{ secrets.CLARITY_BASE_URLS }}
         run: python main.py
         
-      - name: Upload Data Artifact
-        uses: actions/upload-artifact@v4 # Updated Version
+      - name: Upload Clarity Data Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: abandoned-forms-data
-          path: abandoned_forms_data.json
+          name: clarity-data-report
+          path: clarity_data.json
