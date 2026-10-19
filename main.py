@@ -17,13 +17,18 @@ def fetch_airtable_records():
         "Content-Type": "application/json"
     }
 
-    # Standard UTC time: 24 hours ago to now
+    # EXACT 9 AM to 9 AM Logic
     now = datetime.utcnow()
-    start_time = now - timedelta(days=1)
+    # End time is TODAY at exactly 9:00:00 AM
+    end_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    # Start time is YESTERDAY at exactly 9:00:00 AM
+    start_time = end_time - timedelta(days=1)
     
     # Format dates for Airtable
     start_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-    end_str = now.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    end_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
+    print(f"Fetching abandoned forms from {start_str} to {end_str}...")
 
     params = {
         "filterByFormula": f"AND(IS_AFTER(LAST_MODIFIED_TIME(), '{start_str}'), IS_BEFORE(LAST_MODIFIED_TIME(), '{end_str}'))",
@@ -34,9 +39,6 @@ def fetch_airtable_records():
     all_records = []
     offset = None
 
-    print("Fetching abandoned forms from Airtable...")
-    
-    # Pagination loop to fetch all records
     while True:
         if offset:
             params["offset"] = offset
