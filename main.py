@@ -1,9 +1,9 @@
 import os
 import requests
 from datetime import datetime, timedelta
+import pytz
 
 def fetch_airtable_records():
-    # Get credentials from environment variables (GitHub Secrets)
     api_key = os.environ.get("AIRTABLE_API_KEY")
     base_id = os.environ.get("AIRTABLE_BASE_ID")
     table_id = os.environ.get("AIRTABLE_TABLE_ID")
@@ -18,31 +18,52 @@ def fetch_airtable_records():
         "Content-Type": "application/json"
     }
 
-    # Calculate time range: 9 AM yesterday to 9 AM today
-    now = datetime.utcnow()
-    start_time = (now - timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    # Timezone Fix: Exact 9 AM to 9 PM logic for Asia/Karachi
+    tz = pytz.timezone('Asia/Karachi')
+    now = datetime.now(tz)
+    end_time = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    start_time = end_time - timedelta(days=1)
     
-    # Filter records updated in the last 24 hours
+    # Format dates for Airtable
+    start_str = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    end_str = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+
     params = {
-        "filterByFormula": f"IS_AFTER(LAST_MODIFIED_TIME(), '{start_time.isoformat()}Z')",
+        # Only get records modified between 9 AM yesterday and 9 AM today
+        "filterByFormula": f"AND(IS_AFTER(LAST_MODIFIED_TIME(), '{start_str}'), IS_BEFORE(LAST_MODIFIED_TIME(), '{end_str}'))",
         "sort[0][field]": "Last Modified",
         "sort[0][direction]": "desc"
     }
 
-    print("Fetching abandoned forms from Airtable...")
-    response = requests.get(url, headers=headers, params=params)
+    all_records = []
+    offset = None
 
-    if response.status_code == 200:
-        data = response.json()
-        records = data.get("records", [])
-        print(f"✅ Successfully fetched {len(records)} records.")
-        
-        for record in records:
-            fields = record.get("fields", {})
-            print(f"ID: {record.get('id')} | Name: {fields.get('Name', 'N/A')}")
-    else:
-        print(f"❌ Error fetching data: {response.status_code}")
-        print(response.text)
+    print("Fetching abandoned forms from Airtable (9 AM to 9 AM)...")
+    
+    # Pagination Fix: Loop to fetch all records if they are more than 100
+    while True:
+        if offset:
+            params["offset"] = offset
+            
+        response = requests.get(url, headers=headers, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            records = data.get("records", [])
+            all_records.extend(records)
+            offset = data.get("offset") # Check if there are more records
+            if not offset:
+                break # Exit loop when no more pages
+        else:
+            print(f"❌ Error fetching data: {response.status_code}")
+            print(response.text)
+            break
+
+    print(f"✅ Successfully fetched {len(all_records)} records.")
+    
+    for record in all_records[:10]: # Print only first 10 to keep logs clean
+        fields = record.get("fields", {})
+        print(f"ID: {record.get('id')} | Name: {fields.get('Name', 'N/A')}")
 
 if __name__ == "__main__":
     fetch_airtable_records()
