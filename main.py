@@ -4,9 +4,17 @@ Daily Abandoned Forms Report Generator
 ======================================
 End-to-end pipeline that runs in GitHub Actions daily.
 
-PHASE 1 - Fetch abandoned form records from Airtable (9 AM -> next day 9 AM)
+PHASE 1 - Fetch abandoned form records from Airtable (9 AM -> next day 9 AM, Karachi TZ)
 PHASE 2 - Fetch records from 5 Clarity endpoints, compare with Airtable
 PHASE 3 - Auto-generate / overwrite a Google Docs report with the comparison
+
+COMPREHENSIVE FIX (1-shot):
+  Fix 1 - Secret name fallbacks: AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY
+          AIRTABLE_TABLE_NAME OR AIRTABLE_TABLE_ID (works with old or new secret names)
+  Fix 2 - Timezone: Explicitly uses Asia/Karachi for "9 AM" calculation,
+          then converts to UTC for Airtable filter (Airtable stores Created as UTC).
+  Fix 3 - Filter field: Uses 'Last Modified' (catches forms abandoned/updated
+          in the window, not just newly created).
 """
 
 import os
@@ -14,6 +22,7 @@ import sys
 import json
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 # Phase 3 - Google Docs imports
 from google.oauth2 import service_account
@@ -22,13 +31,20 @@ from googleapiclient.errors import HttpError
 
 
 # ============================================================================
+# TIMEZONE CONSTANTS
+# ============================================================================
+KARACHI_TZ = ZoneInfo("Asia/Karachi")
+UTC_TZ = ZoneInfo("UTC")
+
+
+# ============================================================================
 # CONFIGURATION (loaded from environment variables / GitHub Secrets)
 # ============================================================================
-# --- Airtable credentials ---
+
+# --- Airtable credentials (with fallback to old secret names) ---
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME") or os.getenv("AIRTABLE_TABLE_ID")
-
 
 # --- Clarity credentials - 5 endpoints ---
 CLARITY_ENDPOINTS = []
@@ -49,17 +65,20 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ============================================================================
-# TIME WINDOW: yesterday 9 AM -> today 9 AM
+# TIME WINDOW: yesterday 9 AM Karachi -> today 9 AM Karachi
 # ============================================================================
 
 def get_time_window():
-    """Returns (start, end) datetimes for the 24h window ending today 9 AM."""
-    now = datetime.now()
-    end = now.replace(hour=9, minute=0, second=0, microsecond=0)
-    if now < end:
-        end = end - timedelta(days=1)
-    start = end - timedelta(days=1)
-    return start, end
+    """
+    Returns (start, end) datetimes (Karachi TZ) for the 24h window
+    ending at today's 9 AM Karachi time.
+    """
+    now_karachi = datetime.now(KARACHI_TZ)
+    end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now_karachi < end_karachi:
+        end_karachi = end_karachi - timedelta(days=1)
+    start_karachi = end_karachi - timedelta(days=1)
+    return start_karachi, end_karachi
 
 
 # ============================================================================
@@ -107,21 +126,32 @@ def get_clarity_record_id(record):
 
 
 # ============================================================================
-# PHASE 1: AIRTABLE DATA FETCH (with pagination)
+# PHASE 1: AIRTABLE DATA FETCH (with pagination + timezone-aware filter)
 # ============================================================================
 
 def fetch_airtable_data(start_time, end_time):
+    """
+    Fetch abandoned form records from Airtable where 'Last Modified' falls
+    between start_time and end_time. Handles pagination via 'offset'.
+    """
     print("\n" + "=" * 60)
     print("PHASE 1: Fetching data from Airtable")
     print("=" * 60)
-    print(f"Time window: {start_time} -> {end_time}")
+    print(f"Time window (Karachi): {start_time} -> {end_time}")
 
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("Missing Airtable credentials - skipping Phase 1")
+        print(f"  AIRTABLE_TOKEN set: {bool(AIRTABLE_TOKEN)}")
+        print(f"  AIRTABLE_BASE_ID set: {bool(AIRTABLE_BASE_ID)}")
+        print(f"  AIRTABLE_TABLE_NAME set: {bool(AIRTABLE_TABLE_NAME)}")
         return []
 
-    start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
-    end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
+    # Convert Karachi time -> UTC for Airtable filter (Airtable stores time as UTC)
+    start_utc = start_time.astimezone(UTC_TZ)
+    end_utc = end_time.astimezone(UTC_TZ)
+    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    end_str = end_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"Airtable filter (UTC): {start_str} -> {end_str}")
 
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
     headers = {
@@ -129,10 +159,11 @@ def fetch_airtable_data(start_time, end_time):
         "Content-Type": "application/json",
     }
 
+    # Use 'Last Modified' field - catches forms abandoned/updated in the window
     filter_formula = (
         f"AND("
-        f"IS_AFTER({{Created}}, '{start_str}'), "
-        f"IS_BEFORE({{Created}}, '{end_str}')"
+        f"IS_AFTER({{Last Modified}}, '{start_str}'), "
+        f"IS_BEFORE({{Last Modified}}, '{end_str}')"
         f")"
     )
 
@@ -163,11 +194,44 @@ def fetch_airtable_data(start_time, end_time):
 
     print(f"Airtable TOTAL: {len(all_records)} records")
 
+    # Fallback: if Last Modified filter returned 0, try Created field
+    if not all_records:
+        print("  [FALLBACK] Trying filter with 'Created' field instead...")
+        filter_formula_created = (
+            f"AND("
+            f"IS_AFTER({{Created}}, '{start_str}'), "
+            f"IS_BEFORE({{Created}}, '{end_str}')"
+            f")"
+        )
+        offset = None
+        page = 1
+        while True:
+            params = {"filterByFormula": filter_formula_created, "pageSize": 100}
+            if offset:
+                params["offset"] = offset
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                records = data.get("records", [])
+                all_records.extend(records)
+                print(f"  [Created filter] Page {page}: fetched {len(records)} records "
+                      f"(running total: {len(all_records)})")
+                page += 1
+                offset = data.get("offset")
+                if not offset:
+                    break
+            except requests.exceptions.RequestException as e:
+                print(f"  [Created filter] error: {e}")
+                break
+        print(f"  [Created filter] total: {len(all_records)} records")
+
     out_path = os.path.join(OUTPUT_DIR, "airtable_data.json")
     with open(out_path, "w") as f:
         json.dump({
             "source": "airtable",
             "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
+            "filter_utc": {"start": start_str, "end": end_str},
             "total_count": len(all_records),
             "records": all_records,
         }, f, indent=2, default=str)
@@ -180,13 +244,16 @@ def fetch_airtable_data(start_time, end_time):
 # ============================================================================
 
 def fetch_clarity_data(start_time, end_time):
+    """Fetch records from each of the 5 Clarity endpoints."""
     print("\n" + "=" * 60)
     print("PHASE 2: Fetching data from Clarity APIs")
     print("=" * 60)
 
     all_clarity_records = []
-    start_str = start_time.isoformat()
-    end_str = end_time.isoformat()
+    start_iso = start_time.isoformat()
+    end_iso = end_time.isoformat()
+    start_utc_iso = start_time.astimezone(UTC_TZ).isoformat()
+    end_utc_iso = end_time.astimezone(UTC_TZ).isoformat()
 
     for endpoint in CLARITY_ENDPOINTS:
         idx = endpoint["index"]
@@ -198,14 +265,20 @@ def fetch_clarity_data(start_time, end_time):
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
-        params = {"start": start_str, "end": end_str}
+        params = {
+            "start": start_utc_iso,
+            "end": end_utc_iso,
+            "startDate": start_iso,
+            "endDate": end_iso,
+        }
 
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict):
-                records = data.get("records") or data.get("data") or data.get("items") or data.get("results") or []
+                records = (data.get("records") or data.get("data")
+                           or data.get("items") or data.get("results") or [])
             elif isinstance(data, list):
                 records = data
             else:
@@ -233,6 +306,7 @@ def fetch_clarity_data(start_time, end_time):
 
 
 def compare_data(airtable_records, clarity_records, start_time, end_time):
+    """Compare Airtable vs Clarity record sets using record IDs."""
     print("\n" + "=" * 60)
     print("Comparing Airtable vs Clarity data")
     print("=" * 60)
@@ -261,8 +335,6 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
     print(f"  Airtable: {airtable_count} records ({len(airtable_ids)} unique IDs)")
     print(f"  Clarity : {clarity_count} records ({len(clarity_ids)} unique IDs)")
     print(f"  Difference (Clarity - Airtable): {difference}")
-    print(f"  Only in Clarity  (not in Airtable): {len(only_in_clarity)}")
-    print(f"  Only in Airtable (not in Clarity ): {len(only_in_airtable)}")
 
     only_in_clarity_records = [clarity_map[rid] for rid in sorted(only_in_clarity)]
     only_in_airtable_records = [airtable_map[rid] for rid in sorted(only_in_airtable)]
@@ -296,12 +368,13 @@ def format_airtable_summary(record):
     rid = get_airtable_record_id(record) or "?"
     created = (fields.get("Created") or fields.get("Created At")
                or fields.get("US NY Time") or "?")
+    last_mod = fields.get("Last Modified") or "?"
     page_url = fields.get("Page URL") or "?"
     record_source = fields.get("Record Source") or "?"
     is_spam = fields.get("isSpam") or "?"
     ip = fields.get("IP Address") or "?"
     project = fields.get("Project") or "?"
-    return (f"  - ID: {rid}\n    Created: {created}\n"
+    return (f"  - ID: {rid}\n    Created: {created}\n    Last Modified: {last_mod}\n"
             f"    Project: {project} | Source: {record_source}\n"
             f"    Page: {page_url}\n    IP: {ip} | isSpam: {is_spam}")
 
@@ -318,6 +391,7 @@ def format_clarity_summary(record):
 
 
 def generate_google_docs_report(comparison, airtable_records, clarity_records):
+    """Overwrite the configured Google Doc with a freshly formatted report."""
     print("\n" + "=" * 60)
     print("PHASE 3: Generating Google Docs Report")
     print("=" * 60)
@@ -344,8 +418,8 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
         current_title = doc.get("title", "Untitled Document")
         print(f"  Connected to Google Doc: '{current_title}'")
 
-        now = datetime.now()
-        date_str = now.strftime("%d %b %Y, %H:%M")
+        now = datetime.now(KARACHI_TZ)
+        date_str = now.strftime("%d %b %Y, %H:%M (PKT)")
         window_start = comparison["time_window"]["start"]
         window_end = comparison["time_window"]["end"]
         only_in_clarity_records = comparison.get("only_in_clarity_records", [])
@@ -358,7 +432,7 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
             lines = [format_airtable_summary(r) for r in shown]
             text = "\n".join(lines)
             if len(records) > max_display:
-                text += f"\n\n  ... and {len(records) - max_display} more"
+                text += f"\n\n  ... and {len(records) - max_display} more (see artifact JSON for full list)"
             return text
 
         def build_clarity_mismatch(records, max_display=15):
@@ -368,7 +442,7 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
             lines = [format_clarity_summary(r) for r in shown]
             text = "\n".join(lines)
             if len(records) > max_display:
-                text += f"\n\n  ... and {len(records) - max_display} more"
+                text += f"\n\n  ... and {len(records) - max_display} more (see artifact JSON for full list)"
             return text
 
         clarity_mismatch_text = build_clarity_mismatch(only_in_clarity_records)
@@ -419,6 +493,7 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
 ==================================================
 
 Report Date Range  : {window_start} -> {window_end}
+                   (Karachi time, 9 AM to next-day 9 AM)
 Report Generated   : {date_str}
 Generated By       : Daily Forms Bot (GitHub Actions)
 
@@ -528,10 +603,11 @@ from the workflow run page.
 def main():
     print("=" * 60)
     print("  DAILY ABANDONED FORMS REPORT GENERATOR")
+    print("  Timezone: Asia/Karachi (UTC+5)")
     print("=" * 60)
 
     start_time, end_time = get_time_window()
-    print(f"Time window: {start_time} -> {end_time}")
+    print(f"Time window (Karachi): {start_time} -> {end_time}")
 
     airtable_records = fetch_airtable_data(start_time, end_time)
     clarity_records = fetch_clarity_data(start_time, end_time)
