@@ -26,9 +26,10 @@ from googleapiclient.errors import HttpError
 # ============================================================================
 
 # --- Airtable credentials ---
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN")
+# --- Airtable credentials ---
+AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME")
+AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME") or os.getenv("AIRTABLE_TABLE_ID")
 
 # --- Clarity credentials - 5 endpoints ---
 CLARITY_ENDPOINTS = []
