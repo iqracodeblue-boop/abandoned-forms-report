@@ -5,9 +5,30 @@ on:
     - cron: '0 9 * * *'
   workflow_dispatch:
 
+env:
+  PYTHON_VERSION: '3.11'
+  AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+  AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+  AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+  CLARITY_BASE_URL_1: ${{ secrets.CLARITY_BASE_URL_1 }}
+  CLARITY_TOKEN_1: ${{ secrets.CLARITY_TOKEN_1 }}
+  CLARITY_BASE_URL_2: ${{ secrets.CLARITY_BASE_URL_2 }}
+  CLARITY_TOKEN_2: ${{ secrets.CLARITY_TOKEN_2 }}
+  CLARITY_BASE_URL_3: ${{ secrets.CLARITY_BASE_URL_3 }}
+  CLARITY_TOKEN_3: ${{ secrets.CLARITY_TOKEN_3 }}
+  CLARITY_BASE_URL_4: ${{ secrets.CLARITY_BASE_URL_4 }}
+  CLARITY_TOKEN_4: ${{ secrets.CLARITY_TOKEN_4 }}
+  CLARITY_BASE_URL_5: ${{ secrets.CLARITY_BASE_URL_5 }}
+  CLARITY_TOKEN_5: ${{ secrets.CLARITY_TOKEN_5 }}
+  GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+  GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
+  GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+
 jobs:
   fetch-and-report:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -15,24 +36,40 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install -r requirements.txt
 
-      - name: Run Data Fetch & Compare Script
-        env:
-          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-          CLARITY_API_TOKEN: ${{ secrets.CLARITY_API_TOKEN }}
-          CLARITY_BASE_URLS: ${{ secrets.CLARITY_BASE_URLS }}
+      - name: Run Data Fetch & Report Generator
         run: python main.py
-        
-      - name: Upload Clarity Data Artifact
+
+      - name: Upload Airtable Data Artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: clarity-data-report
-          path: clarity_data.json
+          name: airtable-data
+          path: output/airtable_data.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Clarity Data Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clarity-data
+          path: output/clarity_data.json
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Comparison Report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: comparison-report
+          path: output/comparison_report.json
+          retention-days: 14
+          if-no-files-found: warn
