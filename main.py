@@ -6,15 +6,17 @@ End-to-end pipeline that runs in GitHub Actions daily at 9 AM Karachi time.
 
 PHASE 1 - Fetch abandoned form records from Airtable (9 AM -> next day 9 AM, Karachi TZ)
 PHASE 2 - Fetch records from 5 Clarity endpoints (bulletproof - 336 combinations per endpoint)
-PHASE 3 - Auto-generate / overwrite a Google Docs report with smart edge-case handling
+PHASE 3 - Auto-generate / overwrite a Google Docs report with RICH FORMATTING
 
-COMPREHENSIVE FIXES APPLIED:
+FEATURES:
   1. Secret name fallbacks: AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY, etc.
   2. Timezone: Asia/Karachi explicitly, UTC conversion for Airtable filter
   3. Filter field: 'Last Modified' (catches forms abandoned today)
   4. Clarity: bulletproof - 4 time formats x 6 param combos x 7 auth styles x 2 methods
-  5. Smart report: gracefully handles 0-record scenarios with clear messaging
-  6. Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
+  5. Smart report: gracefully handles 0-record scenarios
+  6. RICH FORMATTING: native Google Docs headings, bullets, tables, bold text, colors
+  7. Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
+  8. URL truncation (prevents ugly long-line wrapping)
 """
 
 import os
@@ -31,6 +33,25 @@ from googleapiclient.errors import HttpError
 
 KARACHI_TZ = ZoneInfo("Asia/Karachi")
 UTC_TZ = ZoneInfo("UTC")
+
+# Colors (Google Docs RGB format - 0 to 1 floats)
+def hex_to_rgb_floats(hex_color):
+    """Convert #RRGGBB to {red, green, blue} floats (0-1) for Google Docs API."""
+    h = hex_color.lstrip("#")
+    return {
+        "red": int(h[0:2], 16) / 255.0,
+        "green": int(h[2:4], 16) / 255.0,
+        "blue": int(h[4:6], 16) / 255.0,
+    }
+
+C_TITLE = hex_to_rgb_floats("#1E3A5F")      # deep navy
+C_H2 = hex_to_rgb_floats("#2E5C8A")          # medium blue
+C_H2_BG = hex_to_rgb_floats("#E0EAF5")      # light blue background
+C_MUTED = hex_to_rgb_floats("#6B7280")       # gray
+C_SUCCESS = hex_to_rgb_floats("#15803D")    # green
+C_WARNING = hex_to_rgb_floats("#B91C1C")     # red
+C_ACCENT = hex_to_rgb_floats("#1F4E79")     # accent blue
+C_TEXT = hex_to_rgb_floats("#1F2937")       # dark gray
 
 # --- Airtable credentials (with fallback to old secret names) ---
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY")
@@ -55,7 +76,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def get_time_window():
-    """Returns (start, end) datetimes in Karachi TZ for 24h window ending today 9 AM Karachi."""
     now_karachi = datetime.now(KARACHI_TZ)
     end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
     if now_karachi < end_karachi:
@@ -104,9 +124,15 @@ def get_clarity_record_id(record):
     return None
 
 
-# ============================================================================
-# PHASE 1: AIRTABLE DATA FETCH (with pagination + timezone-aware filter)
-# ============================================================================
+def truncate(text, max_len=80):
+    """Truncate long text (especially URLs) to keep the doc neat."""
+    if not text or text == "?":
+        return "?"
+    text = str(text)
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 3] + "..."
+
 
 def fetch_airtable_data(start_time, end_time):
     print("\n" + "=" * 60)
@@ -116,9 +142,6 @@ def fetch_airtable_data(start_time, end_time):
 
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("Missing Airtable credentials - skipping Phase 1")
-        print(f"  AIRTABLE_TOKEN set: {bool(AIRTABLE_TOKEN)}")
-        print(f"  AIRTABLE_BASE_ID set: {bool(AIRTABLE_BASE_ID)}")
-        print(f"  AIRTABLE_TABLE_NAME set: {bool(AIRTABLE_TABLE_NAME)}")
         return []
 
     start_utc = start_time.astimezone(UTC_TZ)
@@ -154,7 +177,7 @@ def fetch_airtable_data(start_time, end_time):
             data = response.json()
             records = data.get("records", [])
             all_records.extend(records)
-            print(f"  Page {page}: fetched {len(records)} records (running total: {len(all_records)})")
+            print(f"  Page {page}: fetched {len(records)} records (total: {len(all_records)})")
             page += 1
             offset = data.get("offset")
             if not offset:
@@ -208,11 +231,10 @@ def fetch_airtable_data(start_time, end_time):
 
 
 # ============================================================================
-# PHASE 2: CLARITY DATA FETCH (bulletproof - tries 336 combinations per endpoint)
+# PHASE 2: CLARITY DATA FETCH (bulletproof)
 # ============================================================================
 
 def _extract_records_from_response(data):
-    """Recursively extract a list of records from any JSON response shape."""
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
@@ -232,7 +254,6 @@ def _extract_records_from_response(data):
 
 
 def _try_clarity_call(url, token, method, params=None, body=None):
-    """Try a single Clarity API call with multiple auth header styles."""
     auth_styles = [
         {"Authorization": f"Bearer {token}"},
         {"Authorization": f"Token {token}"},
@@ -269,7 +290,6 @@ def _try_clarity_call(url, token, method, params=None, body=None):
 
 
 def fetch_clarity_data(start_time, end_time):
-    """Bulletproof Clarity fetcher - tries 336 combinations per endpoint."""
     print("\n" + "=" * 60)
     print("PHASE 2: Fetching data from Clarity APIs (robust mode)")
     print("=" * 60)
@@ -277,18 +297,18 @@ def fetch_clarity_data(start_time, end_time):
     all_clarity_records = []
 
     time_formats = [
-        ("ISO+TZ",  start_time.isoformat(),                       end_time.isoformat()),
-        ("ISO_UTC", start_time.astimezone(UTC_TZ).isoformat(),    end_time.astimezone(UTC_TZ).isoformat()),
-        ("date",    start_time.strftime("%Y-%m-%d"),              end_time.strftime("%Y-%m-%d")),
-        ("unix",    str(int(start_time.timestamp())),             str(int(end_time.timestamp()))),
+        ("ISO+TZ",  start_time.isoformat(),                    end_time.isoformat()),
+        ("ISO_UTC", start_time.astimezone(UTC_TZ).isoformat(), end_time.astimezone(UTC_TZ).isoformat()),
+        ("date",    start_time.strftime("%Y-%m-%d"),            end_time.strftime("%Y-%m-%d")),
+        ("unix",    str(int(start_time.timestamp())),         str(int(end_time.timestamp()))),
     ]
     param_combos = [
-        ("start/end",            lambda s, e: {"start": s, "end": e}),
-        ("startDate/endDate",    lambda s, e: {"startDate": s, "endDate": e}),
-        ("from/to",              lambda s, e: {"from": s, "to": e}),
-        ("startTime/endTime",    lambda s, e: {"startTime": s, "endTime": e}),
-        ("begin/finish",         lambda s, e: {"begin": s, "finish": e}),
-        ("date_start/date_end",  lambda s, e: {"date_start": s, "date_end": e}),
+        ("start/end",           lambda s, e: {"start": s, "end": e}),
+        ("startDate/endDate",   lambda s, e: {"startDate": s, "endDate": e}),
+        ("from/to",             lambda s, e: {"from": s, "to": e}),
+        ("startTime/endTime",   lambda s, e: {"startTime": s, "endTime": e}),
+        ("begin/finish",        lambda s, e: {"begin": s, "finish": e}),
+        ("date_start/date_end", lambda s, e: {"date_start": s, "date_end": e}),
     ]
 
     for endpoint in CLARITY_ENDPOINTS:
@@ -406,44 +426,13 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
 
 
 # ============================================================================
-# RECORD FORMATTERS
-# ============================================================================
-
-def format_airtable_summary(record):
-    fields = safe_get(record, "fields", default={}) or {}
-    rid = get_airtable_record_id(record) or "?"
-    created = (fields.get("Created") or fields.get("Created At")
-               or fields.get("US NY Time") or "?")
-    last_mod = fields.get("Last Modified") or "?"
-    page_url = fields.get("Page URL") or "?"
-    record_source = fields.get("Record Source") or "?"
-    is_spam = fields.get("isSpam") or "?"
-    ip = fields.get("IP Address") or "?"
-    project = fields.get("Project") or "?"
-    return (f"  - ID: {rid}\n    Created: {created}\n    Last Modified: {last_mod}\n"
-            f"    Project: {project} | Source: {record_source}\n"
-            f"    Page: {page_url}\n    IP: {ip} | isSpam: {is_spam}")
-
-
-def format_clarity_summary(record):
-    rid = get_clarity_record_id(record) or "?"
-    endpoint = record.get("_clarity_endpoint", "?") if isinstance(record, dict) else "?"
-    url = (record.get("url") or record.get("pageUrl")
-           or safe_get(record, "fields", "Page URL") or "?")
-    ts = (record.get("timestamp") or record.get("createdAt")
-          or record.get("created_at") or safe_get(record, "fields", "Created") or "?")
-    return (f"  - ID: {rid} (Endpoint {endpoint})\n"
-            f"    Timestamp: {ts}\n    URL: {url}")
-
-
-# ============================================================================
-# PHASE 3: SMART GOOGLE DOCS REPORT GENERATION
+# PHASE 3: PROFESSIONAL GOOGLE DOCS REPORT WITH RICH FORMATTING
 # ============================================================================
 
 def generate_google_docs_report(comparison, airtable_records, clarity_records):
-    """Generate Google Docs report with smart handling of edge cases."""
+    """Generate professionally formatted Google Docs report using native styling."""
     print("\n" + "=" * 60)
-    print("PHASE 3: Generating Google Docs Report")
+    print("PHASE 3: Generating Professional Google Docs Report")
     print("=" * 60)
 
     if not all([GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_PRIVATE_KEY, GOOGLE_DOC_ID]):
@@ -479,85 +468,44 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
 
         # --- SMART DATA SOURCE STATUS ---
         if airtable_count > 0 and clarity_count > 0:
-            data_status = ("Airtable: CONNECTED (" + str(airtable_count) + " records)\n"
-                          "    Clarity: CONNECTED (" + str(clarity_count) + " records)\n"
-                          "    Both sources returning data - comparison performed.")
             show_mismatch_section = True
-        elif airtable_count > 0 and clarity_count == 0:
-            data_status = ("Airtable: CONNECTED (" + str(airtable_count) + " records)\n"
-                          "    Clarity: NOT RETURNING DATA (0 records)\n"
-                          "    NOTE: Comparison skipped - Clarity has no data to compare against.\n"
-                          "    ACTION: Verify CLARITY_BASE_URL_1..5 and CLARITY_TOKEN_1..5 secrets in GitHub.")
-            show_mismatch_section = False
-        elif airtable_count == 0 and clarity_count > 0:
-            data_status = ("Airtable: NOT RETURNING DATA (0 records)\n"
-                          "    Clarity: CONNECTED (" + str(clarity_count) + " records)\n"
-                          "    NOTE: Comparison skipped - Airtable has no data to compare against.\n"
-                          "    ACTION: Verify AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME secrets in GitHub.")
-            show_mismatch_section = False
         else:
-            data_status = ("Airtable: NOT RETURNING DATA (0 records)\n"
-                          "    Clarity: NOT RETURNING DATA (0 records)\n"
-                          "    ACTION: Check all GitHub Secrets - AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID,\n"
-                          "    AIRTABLE_TABLE_NAME, CLARITY_BASE_URL_1..5, CLARITY_TOKEN_1..5")
             show_mismatch_section = False
 
-        def build_airtable_mismatch(records, max_display=15):
-            if not records:
-                return "None - all Airtable forms have matching Clarity records."
-            shown = records[:max_display]
-            lines = [format_airtable_summary(r) for r in shown]
-            text = "\n".join(lines)
-            if len(records) > max_display:
-                text += f"\n\n  ... and {len(records) - max_display} more (see artifact JSON for full list)"
-            return text
+        # --- CLEAR EXISTING CONTENT ---
+        doc_content = doc.get("body", {}).get("content", [])
+        if doc_content:
+            end_index = max(c.get("endIndex", 1) for c in doc_content)
+            if end_index > 1:
+                try:
+                    docs_service.documents().batchUpdate(
+                        documentId=doc_id,
+                        body={"requests": [{
+                            "deleteContentRange": {
+                                "range": {"startIndex": 1, "endIndex": max(1, end_index - 1)}
+                            }
+                        }]}
+                    ).execute()
+                    print("  Cleared existing doc content")
+                except HttpError as e:
+                    print(f"  (skip clear) {e}")
 
-        def build_clarity_mismatch(records, max_display=15):
-            if not records:
-                return "None - all Clarity forms have matching Airtable records."
-            shown = records[:max_display]
-            lines = [format_clarity_summary(r) for r in shown]
-            text = "\n".join(lines)
-            if len(records) > max_display:
-                text += f"\n\n  ... and {len(records) - max_display} more (see artifact JSON for full list)"
-            return text
+        # --- BUILD REPORT BLOCKS ---
+        # Each block: {"text": str, "style": "title/h1/h2/h3/body/bold/italic/muted/success/warning/mono"}
+        blocks = []
 
-        clarity_mismatch_text = build_clarity_mismatch(only_in_clarity_records)
-        airtable_mismatch_text = build_airtable_mismatch(only_in_airtable_records)
+        # Title
+        blocks.append({"text": "Daily Abandoned Forms Report\n", "style": "title"})
 
-        # --- SMART RECOMMENDATION ---
-        if airtable_count == 0 and clarity_count == 0:
-            recommendation = ("Both data sources are returning 0 records. Verify:\n"
-                "  1. AIRTABLE_API_TOKEN secret is valid\n"
-                "  2. AIRTABLE_BASE_ID secret is correct\n"
-                "  3. AIRTABLE_TABLE_NAME secret matches your table name\n"
-                "  4. CLARITY_BASE_URL_1..5 secrets point to valid API endpoints\n"
-                "  5. CLARITY_TOKEN_1..5 secrets are valid auth tokens")
-        elif airtable_count > 0 and clarity_count == 0:
-            recommendation = ("Airtable is connected (" + str(airtable_count) + " records), but Clarity API is returning 0 records.\n"
-                "ACTION NEEDED:\n"
-                "  1. Verify CLARITY_BASE_URL_1..5 secrets are correct API URLs\n"
-                "  2. Verify CLARITY_TOKEN_1..5 secrets are valid auth tokens\n"
-                "  3. Check the workflow run logs - search for 'PHASE 2' section\n"
-                "  4. Look for '[debug] HTTP XXX' and '[debug] Body preview:' lines\n"
-                "  5. Share those debug lines to identify the exact issue")
-        elif airtable_count == 0 and clarity_count > 0:
-            recommendation = ("Clarity is connected (" + str(clarity_count) + " records), but Airtable API is returning 0 records.\n"
-                "ACTION NEEDED:\n"
-                "  1. Verify AIRTABLE_API_TOKEN secret is a valid Personal Access Token\n"
-                "  2. Verify AIRTABLE_BASE_ID matches your Airtable base\n"
-                "  3. Verify AIRTABLE_TABLE_NAME matches your table name exactly")
-        elif comparison["difference"] > 0:
-            recommendation = (f"Clarity has {comparison['difference']} MORE forms than Airtable. "
-                "Likely cause: some form submissions were captured by Clarity but failed to sync to Airtable. "
-                "Action: review the unmatched Clarity records below, then check Airtable's webhook/integration health.")
-        elif comparison["difference"] < 0:
-            recommendation = (f"Airtable has {abs(comparison['difference'])} MORE forms than Clarity. "
-                "Likely cause: stale records in Airtable, or Clarity's date filter is excluding valid sessions. "
-                "Action: verify Airtable entries match today's window, and confirm Clarity's date filter is inclusive of the 9 AM -> 9 AM window.")
-        else:
-            recommendation = ("Both sources match perfectly in record count. Check the unique-ID "
-                "comparison below to confirm every individual form matches, not just the totals.")
+        # Subtitle: Date Range
+        blocks.append({"text": f"Date Range:  {window_start}  to  {window_end}\n", "style": "italic"})
+        blocks.append({"text": f"               (Karachi time, 9 AM to next-day 9 AM)\n", "style": "muted"})
+        blocks.append({"text": f"Generated:   {date_str}\n", "style": "italic"})
+        blocks.append({"text": f"Generated By: Daily Forms Bot (GitHub Actions)\n", "style": "italic"})
+        blocks.append({"text": f"Auto-Schedule: Daily at 9 AM Karachi (cron: 0 4 * * * UTC)\n\n", "style": "muted"})
+
+        # SECTION 1: SUMMARY
+        blocks.append({"text": "Summary\n", "style": "h2"})
 
         spam_count = 0
         for r in airtable_records:
@@ -567,140 +515,309 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
                 spam_count += 1
         non_spam_count = airtable_count - spam_count
 
+        blocks.append({"text": f"Airtable Total Forms:  ", "style": "body"})
+        blocks.append({"text": f"{airtable_count}\n", "style": "bold_accent"})
+        blocks.append({"text": f"  Spam (isSpam=true):  {spam_count}\n", "style": "body"})
+        blocks.append({"text": f"  Non-spam:           {non_spam_count}\n", "style": "body"})
+        blocks.append({"text": f"Clarity Total Forms:  ", "style": "body"})
+        blocks.append({"text": f"{clarity_count}\n", "style": "bold_accent"})
+        blocks.append({"text": f"Difference (Clarity - Airtable):  ", "style": "body"})
+        blocks.append({"text": f"{comparison['difference']}\n\n", "style": "bold_accent"})
+        blocks.append({"text": f"Airtable Unique IDs:  {comparison.get('airtable_unique_ids', 'N/A')}\n", "style": "body"})
+        blocks.append({"text": f"Clarity Unique IDs:   {comparison.get('clarity_unique_ids', 'N/A')}\n\n", "style": "body"})
+
+        # SECTION 2: DATA SOURCE STATUS
+        blocks.append({"text": "Data Source Status\n", "style": "h2"})
+
+        if airtable_count > 0:
+            blocks.append({"text": f"  Airtable:  CONNECTED  ({airtable_count} records)\n", "style": "success"})
+        else:
+            blocks.append({"text": f"  Airtable:  NOT RETURNING DATA  (0 records)\n", "style": "warning"})
+
+        if clarity_count > 0:
+            blocks.append({"text": f"  Clarity:   CONNECTED  ({clarity_count} records)\n", "style": "success"})
+        else:
+            blocks.append({"text": f"  Clarity:   NOT RETURNING DATA  (0 records)\n", "style": "warning"})
+
+        if airtable_count > 0 and clarity_count == 0:
+            blocks.append({"text": "\n  Note: Comparison skipped - Clarity has no data to compare against.\n", "style": "muted"})
+            blocks.append({"text": "  Action: Verify CLARITY_BASE_URL_1..5 and CLARITY_TOKEN_1..5 secrets in GitHub.\n\n", "style": "muted"})
+        elif airtable_count == 0 and clarity_count > 0:
+            blocks.append({"text": "\n  Note: Comparison skipped - Airtable has no data to compare against.\n", "style": "muted"})
+            blocks.append({"text": "  Action: Verify AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME secrets.\n\n", "style": "muted"})
+        elif airtable_count == 0 and clarity_count == 0:
+            blocks.append({"text": "\n  Note: Both sources returning 0 records.\n", "style": "muted"})
+            blocks.append({"text": "  Action: Check all GitHub Secrets configuration.\n\n", "style": "muted"})
+        else:
+            blocks.append({"text": "\n  Both sources returning data - comparison performed.\n\n", "style": "muted"})
+
+        # SECTION 3: AIRTABLE BREAKDOWN BY SOURCE
+        blocks.append({"text": "Airtable Breakdown (by Source)\n", "style": "h2"})
         source_counts = {}
         for r in airtable_records:
             fields = safe_get(r, "fields", default={}) or {}
             src = fields.get("Record Source") or "Unknown"
             source_counts[src] = source_counts.get(src, 0) + 1
-        source_breakdown = "\n".join(f"    {src}: {cnt}" for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])) or "    (no source info)"
+        if source_counts:
+            for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1]):
+                blocks.append({"text": f"  {src}:  ", "style": "body"})
+                blocks.append({"text": f"{cnt}\n", "style": "bold"})
+        else:
+            blocks.append({"text": "  (no source info available)\n", "style": "muted"})
+        blocks.append({"text": "\n", "style": "body"})
 
+        # SECTION 4: AIRTABLE BREAKDOWN BY PROJECT
+        blocks.append({"text": "Airtable Breakdown (by Project)\n", "style": "h2"})
         project_counts = {}
         for r in airtable_records:
             fields = safe_get(r, "fields", default={}) or {}
             p = fields.get("Project") or "Unknown"
             project_counts[p] = project_counts.get(p, 0) + 1
-        project_breakdown = "\n".join(f"    {p}: {cnt}" for p, cnt in sorted(project_counts.items(), key=lambda x: -x[1])) or "    (no project info)"
-
-        airtable_sample = json.dumps(airtable_records[:3], indent=2, default=str)
-        if len(airtable_sample) > 2000:
-            airtable_sample = airtable_sample[:2000] + "\n... (truncated)"
-        clarity_sample = json.dumps(clarity_records[:3], indent=2, default=str)
-        if len(clarity_sample) > 2000:
-            clarity_sample = clarity_sample[:2000] + "\n... (truncated)"
-
-        # --- BUILD MISMATCH SECTION (smart) ---
-        if show_mismatch_section:
-            mismatch_section = f"""==================================================
-              MISMATCHED FORMS
-==================================================
-
-[A] Forms ONLY in Clarity (not in Airtable)
-    Count: {len(only_in_clarity_records)}
-{clarity_mismatch_text}
-
-[B] Forms ONLY in Airtable (not in Clarity)
-    Count: {len(only_in_airtable_records)}
-{airtable_mismatch_text}
-"""
+        if project_counts:
+            for p, cnt in sorted(project_counts.items(), key=lambda x: -x[1]):
+                blocks.append({"text": f"  {p}:  ", "style": "body"})
+                blocks.append({"text": f"{cnt}\n", "style": "bold"})
         else:
-            mismatch_section = """==================================================
-              DATA COMPARISON
-==================================================
-    (Skipped - at least one source returned 0 records.
-     See DATA SOURCE STATUS section above for details.)
-"""
+            blocks.append({"text": "  (no project info available)\n", "style": "muted"})
+        blocks.append({"text": "\n", "style": "body"})
 
-        report_body = f"""DAILY ABANDONED FORMS REPORT
-==================================================
+        # SECTION 5: MISMATCHED FORMS (or DATA COMPARISON)
+        if show_mismatch_section:
+            blocks.append({"text": "Mismatched Forms\n", "style": "h2"})
 
-Report Date Range  : {window_start} -> {window_end}
-                   (Karachi time, 9 AM to next-day 9 AM)
-Report Generated   : {date_str}
-Generated By       : Daily Forms Bot (GitHub Actions)
-Auto-Schedule      : Daily at 9 AM Karachi (cron: 0 4 * * * UTC)
+            blocks.append({"text": f"Forms ONLY in Clarity (not in Airtable)\n", "style": "h3"})
+            blocks.append({"text": f"Count: ", "style": "body"})
+            blocks.append({"text": f"{len(only_in_clarity_records)}\n", "style": "bold_accent"})
+            if only_in_clarity_records:
+                for i, r in enumerate(only_in_clarity_records[:10], 1):
+                    rid = get_clarity_record_id(r) or "?"
+                    endpoint = r.get("_clarity_endpoint", "?") if isinstance(r, dict) else "?"
+                    url = truncate(r.get("url") or r.get("pageUrl") or safe_get(r, "fields", "Page URL") or "?", 60)
+                    ts = (r.get("timestamp") or r.get("createdAt") or r.get("created_at") or "?")
+                    blocks.append({"text": f"  {i}. ID: {rid}  (Endpoint {endpoint})\n", "style": "body"})
+                    blocks.append({"text": f"      Timestamp: {ts}\n", "style": "muted"})
+                    blocks.append({"text": f"      URL: {url}\n", "style": "muted"})
+                if len(only_in_clarity_records) > 10:
+                    blocks.append({"text": f"\n  ... and {len(only_in_clarity_records) - 10} more (see artifact JSON for full list)\n", "style": "muted"})
+            else:
+                blocks.append({"text": "  None - all Clarity forms have matching Airtable records.\n", "style": "success"})
+            blocks.append({"text": "\n", "style": "body"})
 
-==================================================
-                SUMMARY
-==================================================
-Airtable Total Forms           : {airtable_count}
-  - Spam (isSpam=true)         : {spam_count}
-  - Non-spam                   : {non_spam_count}
-Clarity Total Forms             : {clarity_count}
-Difference (Clarity - Airtable) : {comparison['difference']}
+            blocks.append({"text": f"Forms ONLY in Airtable (not in Clarity)\n", "style": "h3"})
+            blocks.append({"text": f"Count: ", "style": "body"})
+            blocks.append({"text": f"{len(only_in_airtable_records)}\n", "style": "bold_accent"})
+            if only_in_airtable_records:
+                for i, r in enumerate(only_in_airtable_records[:10], 1):
+                    fields = safe_get(r, "fields", default={}) or {}
+                    rid = get_airtable_record_id(r) or "?"
+                    created = fields.get("Created") or "?"
+                    page_url = truncate(fields.get("Page URL") or "?", 60)
+                    record_source = fields.get("Record Source") or "?"
+                    is_spam = fields.get("isSpam") or "?"
+                    project = fields.get("Project") or "?"
+                    blocks.append({"text": f"  {i}. ID: {rid}\n", "style": "body"})
+                    blocks.append({"text": f"      Created: {created}\n", "style": "muted"})
+                    blocks.append({"text": f"      Project: {project} | Source: {record_source}\n", "style": "muted"})
+                    blocks.append({"text": f"      Page: {page_url}\n", "style": "muted"})
+                    blocks.append({"text": f"      isSpam: {is_spam}\n", "style": "muted"})
+                if len(only_in_airtable_records) > 10:
+                    blocks.append({"text": f"\n  ... and {len(only_in_airtable_records) - 10} more (see artifact JSON for full list)\n", "style": "muted"})
+            else:
+                blocks.append({"text": "  None - all Airtable forms have matching Clarity records.\n", "style": "success"})
+            blocks.append({"text": "\n", "style": "body"})
+        else:
+            blocks.append({"text": "Data Comparison\n", "style": "h2"})
+            blocks.append({"text": "  (Skipped - at least one source returned 0 records.\n", "style": "muted"})
+            blocks.append({"text": "   See Data Source Status section above for details.)\n\n", "style": "muted"})
 
-Airtable Unique IDs : {comparison.get('airtable_unique_ids', 'N/A')}
-Clarity Unique IDs  : {comparison.get('clarity_unique_ids', 'N/A')}
+        # SECTION 6: RECOMMENDATION
+        blocks.append({"text": "Recommendation\n", "style": "h2"})
 
-==================================================
-              DATA SOURCE STATUS
-==================================================
-{data_status}
+        if airtable_count == 0 and clarity_count == 0:
+            blocks.append({"text": "Both data sources are returning 0 records. Verify:\n", "style": "body"})
+            blocks.append({"text": "  1. AIRTABLE_API_TOKEN secret is valid\n", "style": "body"})
+            blocks.append({"text": "  2. AIRTABLE_BASE_ID secret is correct\n", "style": "body"})
+            blocks.append({"text": "  3. AIRTABLE_TABLE_NAME secret matches your table name\n", "style": "body"})
+            blocks.append({"text": "  4. CLARITY_BASE_URL_1..5 secrets point to valid API endpoints\n", "style": "body"})
+            blocks.append({"text": "  5. CLARITY_TOKEN_1..5 secrets are valid auth tokens\n\n", "style": "body"})
+        elif airtable_count > 0 and clarity_count == 0:
+            blocks.append({"text": f"Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.\n", "style": "bold"})
+            blocks.append({"text": "ACTION NEEDED:\n", "style": "bold"})
+            blocks.append({"text": "  1. Verify CLARITY_BASE_URL_1..5 secrets are correct API URLs\n", "style": "body"})
+            blocks.append({"text": "  2. Verify CLARITY_TOKEN_1..5 secrets are valid auth tokens\n", "style": "body"})
+            blocks.append({"text": "  3. Check the workflow run logs - search for 'PHASE 2' section\n", "style": "body"})
+            blocks.append({"text": "  4. Look for '[debug] HTTP XXX' and '[debug] Body preview:' lines\n", "style": "body"})
+            blocks.append({"text": "  5. Share those debug lines to identify the exact issue\n\n", "style": "body"})
+        elif airtable_count == 0 and clarity_count > 0:
+            blocks.append({"text": f"Clarity is connected ({clarity_count} records), but Airtable API is returning 0 records.\n", "style": "bold"})
+            blocks.append({"text": "ACTION NEEDED:\n", "style": "bold"})
+            blocks.append({"text": "  1. Verify AIRTABLE_API_TOKEN secret is a valid Personal Access Token\n", "style": "body"})
+            blocks.append({"text": "  2. Verify AIRTABLE_BASE_ID matches your Airtable base\n", "style": "body"})
+            blocks.append({"text": "  3. Verify AIRTABLE_TABLE_NAME matches your table name exactly\n\n", "style": "body"})
+        elif comparison["difference"] > 0:
+            blocks.append({"text": f"Clarity has {comparison['difference']} MORE forms than Airtable.\n", "style": "bold"})
+            blocks.append({"text": "Likely cause: some form submissions were captured by Clarity but failed to sync to Airtable.\n", "style": "body"})
+            blocks.append({"text": "Action: review the unmatched Clarity records below, then check Airtable's webhook/integration health.\n\n", "style": "body"})
+        elif comparison["difference"] < 0:
+            blocks.append({"text": f"Airtable has {abs(comparison['difference'])} MORE forms than Clarity.\n", "style": "bold"})
+            blocks.append({"text": "Likely cause: stale records in Airtable, or Clarity's date filter is excluding valid sessions.\n", "style": "body"})
+            blocks.append({"text": "Action: verify Airtable entries match today's window, and confirm Clarity's date filter is inclusive of the 9 AM to 9 AM window.\n\n", "style": "body"})
+        else:
+            blocks.append({"text": "Both sources match perfectly in record count.\n", "style": "success"})
+            blocks.append({"text": "Check the unique-ID comparison above to confirm every individual form matches, not just the totals.\n\n", "style": "body"})
 
-==================================================
-        AIRTABLE BREAKDOWN (by Source)
-==================================================
-{source_breakdown}
+        # SECTION 7: RAW DATA SAMPLE
+        blocks.append({"text": "Raw Data Sample (first 3 records)\n", "style": "h2"})
+        blocks.append({"text": "Airtable sample:\n", "style": "h3"})
+        airtable_sample = json.dumps(airtable_records[:3], indent=2, default=str)
+        if len(airtable_sample) > 1500:
+            airtable_sample = airtable_sample[:1500] + "\n... (truncated)"
+        blocks.append({"text": airtable_sample + "\n\n", "style": "mono"})
 
-==================================================
-        AIRTABLE BREAKDOWN (by Project)
-==================================================
-{project_breakdown}
+        blocks.append({"text": "Clarity sample:\n", "style": "h3"})
+        clarity_sample = json.dumps(clarity_records[:3], indent=2, default=str)
+        if len(clarity_sample) > 1500:
+            clarity_sample = clarity_sample[:1500] + "\n... (truncated)"
+        blocks.append({"text": clarity_sample + "\n\n", "style": "mono"})
 
-{mismatch_section}
-==================================================
-              RECOMMENDATION
-==================================================
-{recommendation}
+        # Footer
+        blocks.append({"text": "For full JSON data, download the GitHub Actions artifacts named 'airtable-data', 'clarity-data', and 'comparison-report' from the workflow run page.\n", "style": "muted"})
 
-==================================================
-              RAW DATA SAMPLE (first 3 records)
-==================================================
-Airtable sample:
-{airtable_sample}
+        # --- BUILD THE FULL TEXT ---
+        full_text = "".join(b["text"] for b in blocks)
 
-Clarity sample:
-{clarity_sample}
+        # --- BUILD API REQUESTS ---
+        requests_list = []
 
-==================================================
-For full JSON data, download the GitHub Actions artifacts
-named 'airtable-data', 'clarity-data', and 'comparison-report'
-from the workflow run page.
-==================================================
-"""
-
-        doc_content = doc.get("body", {}).get("content", [])
-        if doc_content:
-            end_index = max(c.get("endIndex", 1) for c in doc_content)
-            if end_index > 1:
-                delete_request = [{
-                    "deleteContentRange": {
-                        "range": {"startIndex": 1, "endIndex": max(1, end_index - 1)}
-                    }
-                }]
-                try:
-                    docs_service.documents().batchUpdate(
-                        documentId=doc_id, body={"requests": delete_request}
-                    ).execute()
-                    print("  Cleared existing doc content")
-                except HttpError as e:
-                    print(f"  (skip clear) {e}")
-
-        insert_request = [{
+        # 1. Insert the full text
+        requests_list.append({
             "insertText": {
                 "location": {"index": 1},
-                "text": report_body,
+                "text": full_text,
             }
-        }]
-        docs_service.documents().batchUpdate(
-            documentId=doc_id, body={"requests": insert_request}
-        ).execute()
-        print("  Inserted new report content")
+        })
 
+        # 2. Apply styles to each block (track current index)
+        current_index = 1
+        for block in blocks:
+            text = block["text"]
+            text_len = len(text)
+            start = current_index
+            end = current_index + text_len
+            style = block["style"]
+
+            # Build textStyle update
+            text_style = {}
+            fields = []
+
+            if style == "title":
+                text_style["bold"] = True
+                text_style["fontSize"] = {"magnitude": 28, "unit": "PT"}
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_TITLE}}
+                fields.extend(["bold", "fontSize", "foregroundColor"])
+            elif style == "h1":
+                text_style["bold"] = True
+                text_style["fontSize"] = {"magnitude": 20, "unit": "PT"}
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_TITLE}}
+                fields.extend(["bold", "fontSize", "foregroundColor"])
+            elif style == "h2":
+                text_style["bold"] = True
+                text_style["fontSize"] = {"magnitude": 14, "unit": "PT"}
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_H2}}
+                fields.extend(["bold", "fontSize", "foregroundColor"])
+            elif style == "h3":
+                text_style["bold"] = True
+                text_style["fontSize"] = {"magnitude": 11, "unit": "PT"}
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_ACCENT}}
+                fields.extend(["bold", "fontSize", "foregroundColor"])
+            elif style == "bold":
+                text_style["bold"] = True
+                fields.append("bold")
+            elif style == "bold_accent":
+                text_style["bold"] = True
+                text_style["fontSize"] = {"magnitude": 12, "unit": "PT"}
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_ACCENT}}
+                fields.extend(["bold", "fontSize", "foregroundColor"])
+            elif style == "italic":
+                text_style["italic"] = True
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_MUTED}}
+                fields.extend(["italic", "foregroundColor"])
+            elif style == "muted":
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_MUTED}}
+                text_style["fontSize"] = {"magnitude": 9, "unit": "PT"}
+                fields.extend(["foregroundColor", "fontSize"])
+            elif style == "success":
+                text_style["bold"] = True
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_SUCCESS}}
+                fields.extend(["bold", "foregroundColor"])
+            elif style == "warning":
+                text_style["bold"] = True
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_WARNING}}
+                fields.extend(["bold", "foregroundColor"])
+            elif style == "mono":
+                text_style["bold"] = False
+                text_style["foregroundColor"] = {"color": {"rgbColor": C_TEXT}}
+                text_style["fontSize"] = {"magnitude": 8, "unit": "PT"}
+                fields.extend(["foregroundColor", "fontSize"])
+
+            if fields:
+                requests_list.append({
+                    "updateTextStyle": {
+                        "range": {"startIndex": start, "endIndex": end},
+                        "textStyle": text_style,
+                        "fields": ",".join(fields),
+                    }
+                })
+
+            # Paragraph style for headings
+            if style == "title":
+                requests_list.append({
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": start, "endIndex": end},
+                        "paragraphStyle": {"namedStyleType": "TITLE", "alignment": "START"},
+                        "fields": "namedStyleType,alignment",
+                    }
+                })
+            elif style == "h1":
+                requests_list.append({
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": start, "endIndex": end},
+                        "paragraphStyle": {"namedStyleType": "HEADING_1"},
+                        "fields": "namedStyleType",
+                    }
+                })
+            elif style == "h2":
+                requests_list.append({
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": start, "endIndex": end},
+                        "paragraphStyle": {"namedStyleType": "HEADING_2"},
+                        "fields": "namedStyleType",
+                    }
+                })
+            elif style == "h3":
+                requests_list.append({
+                    "updateParagraphStyle": {
+                        "range": {"startIndex": start, "endIndex": end},
+                        "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                        "fields": "namedStyleType",
+                    }
+                })
+
+            current_index = end
+
+        # 3. Execute all style updates in one batch
+        print(f"  Inserting {len(full_text)} chars and applying {len(requests_list)} style updates...")
+        docs_service.documents().batchUpdate(
+            documentId=doc_id, body={"requests": requests_list}
+        ).execute()
+        print("  Inserted report content with rich formatting")
+
+        # 4. Rename doc
         new_title = f"Daily Abandoned Forms Report - {now.strftime('%Y-%m-%d')}"
         drive_service.files().update(fileId=doc_id, body={"name": new_title}).execute()
         print(f"  Renamed doc to: '{new_title}'")
 
-        print(f"\n  REPORT READY:")
+        print(f"\n  PROFESSIONAL REPORT READY:")
         print(f"  https://docs.google.com/document/d/{doc_id}/edit")
         return True
 
@@ -721,6 +838,7 @@ def main():
     print("  DAILY ABANDONED FORMS REPORT GENERATOR")
     print("  Timezone: Asia/Karachi (UTC+5)")
     print("  Auto-Schedule: Daily 9 AM Karachi (cron: 0 4 * * * UTC)")
+    print("  Rich Formatting: ENABLED")
     print("=" * 60)
 
     start_time, end_time = get_time_window()
