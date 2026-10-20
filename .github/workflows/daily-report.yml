@@ -2,14 +2,17 @@ name: Daily Abandoned Forms Report
 
 on:
   schedule:
-    - cron: '0 9 * * *'
+    - cron: '0 4 * * *'   # 9 AM Karachi (UTC+5) = 4 AM UTC
   workflow_dispatch:
 
 env:
   PYTHON_VERSION: '3.11'
+  TZ: 'Asia/Karachi'      # Belt-and-suspenders: set system TZ too
   AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
+  AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
   AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
   AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
+  AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
   CLARITY_BASE_URL_1: ${{ secrets.CLARITY_BASE_URL_1 }}
   CLARITY_TOKEN_1: ${{ secrets.CLARITY_TOKEN_1 }}
   CLARITY_BASE_URL_2: ${{ secrets.CLARITY_BASE_URL_2 }}
