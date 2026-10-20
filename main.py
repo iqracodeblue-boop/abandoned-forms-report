@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-Daily Abandoned Forms Report Generator
-======================================
-End-to-end pipeline that runs in GitHub Actions daily.
+Daily Abandoned Forms Report Generator (Final - Production Ready)
+=================================================================
+End-to-end pipeline that runs in GitHub Actions daily at 9 AM Karachi time.
 
 PHASE 1 - Fetch abandoned form records from Airtable (9 AM -> next day 9 AM, Karachi TZ)
-PHASE 2 - Fetch records from 5 Clarity endpoints (bulletproof - tries 336 combinations per endpoint)
-PHASE 3 - Auto-generate / overwrite a Google Docs report with the comparison
+PHASE 2 - Fetch records from 5 Clarity endpoints (bulletproof - 336 combinations per endpoint)
+PHASE 3 - Auto-generate / overwrite a Google Docs report with smart edge-case handling
 
-COMPREHENSIVE FIX:
-  - Secret name fallbacks (AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY, etc.)
-  - Timezone: Asia/Karachi explicitly, UTC conversion for Airtable filter
-  - Filter field: 'Last Modified' (catches forms abandoned today)
-  - Clarity: bulletproof - tries 4 time formats × 6 param combos × 7 auth styles × 2 methods
+COMPREHENSIVE FIXES APPLIED:
+  1. Secret name fallbacks: AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY, etc.
+  2. Timezone: Asia/Karachi explicitly, UTC conversion for Airtable filter
+  3. Filter field: 'Last Modified' (catches forms abandoned today)
+  4. Clarity: bulletproof - 4 time formats x 6 param combos x 7 auth styles x 2 methods
+  5. Smart report: gracefully handles 0-record scenarios with clear messaging
+  6. Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
 """
 
 import os
@@ -53,6 +55,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 def get_time_window():
+    """Returns (start, end) datetimes in Karachi TZ for 24h window ending today 9 AM Karachi."""
     now_karachi = datetime.now(KARACHI_TZ)
     end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
     if now_karachi < end_karachi:
@@ -101,6 +104,10 @@ def get_clarity_record_id(record):
     return None
 
 
+# ============================================================================
+# PHASE 1: AIRTABLE DATA FETCH (with pagination + timezone-aware filter)
+# ============================================================================
+
 def fetch_airtable_data(start_time, end_time):
     print("\n" + "=" * 60)
     print("PHASE 1: Fetching data from Airtable")
@@ -109,6 +116,9 @@ def fetch_airtable_data(start_time, end_time):
 
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("Missing Airtable credentials - skipping Phase 1")
+        print(f"  AIRTABLE_TOKEN set: {bool(AIRTABLE_TOKEN)}")
+        print(f"  AIRTABLE_BASE_ID set: {bool(AIRTABLE_BASE_ID)}")
+        print(f"  AIRTABLE_TABLE_NAME set: {bool(AIRTABLE_TABLE_NAME)}")
         return []
 
     start_utc = start_time.astimezone(UTC_TZ)
@@ -196,6 +206,10 @@ def fetch_airtable_data(start_time, end_time):
         }, f, indent=2, default=str)
     return all_records
 
+
+# ============================================================================
+# PHASE 2: CLARITY DATA FETCH (bulletproof - tries 336 combinations per endpoint)
+# ============================================================================
 
 def _extract_records_from_response(data):
     """Recursively extract a list of records from any JSON response shape."""
@@ -336,6 +350,10 @@ def fetch_clarity_data(start_time, end_time):
     return all_clarity_records
 
 
+# ============================================================================
+# COMPARISON LOGIC
+# ============================================================================
+
 def compare_data(airtable_records, clarity_records, start_time, end_time):
     print("\n" + "=" * 60)
     print("Comparing Airtable vs Clarity data")
@@ -387,6 +405,10 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
     return comparison
 
 
+# ============================================================================
+# RECORD FORMATTERS
+# ============================================================================
+
 def format_airtable_summary(record):
     fields = safe_get(record, "fields", default={}) or {}
     rid = get_airtable_record_id(record) or "?"
@@ -414,7 +436,12 @@ def format_clarity_summary(record):
             f"    Timestamp: {ts}\n    URL: {url}")
 
 
+# ============================================================================
+# PHASE 3: SMART GOOGLE DOCS REPORT GENERATION
+# ============================================================================
+
 def generate_google_docs_report(comparison, airtable_records, clarity_records):
+    """Generate Google Docs report with smart handling of edge cases."""
     print("\n" + "=" * 60)
     print("PHASE 3: Generating Google Docs Report")
     print("=" * 60)
@@ -447,6 +474,33 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
         window_end = comparison["time_window"]["end"]
         only_in_clarity_records = comparison.get("only_in_clarity_records", [])
         only_in_airtable_records = comparison.get("only_in_airtable_records", [])
+        airtable_count = comparison["airtable_count"]
+        clarity_count = comparison["clarity_count"]
+
+        # --- SMART DATA SOURCE STATUS ---
+        if airtable_count > 0 and clarity_count > 0:
+            data_status = ("Airtable: CONNECTED (" + str(airtable_count) + " records)\n"
+                          "    Clarity: CONNECTED (" + str(clarity_count) + " records)\n"
+                          "    Both sources returning data - comparison performed.")
+            show_mismatch_section = True
+        elif airtable_count > 0 and clarity_count == 0:
+            data_status = ("Airtable: CONNECTED (" + str(airtable_count) + " records)\n"
+                          "    Clarity: NOT RETURNING DATA (0 records)\n"
+                          "    NOTE: Comparison skipped - Clarity has no data to compare against.\n"
+                          "    ACTION: Verify CLARITY_BASE_URL_1..5 and CLARITY_TOKEN_1..5 secrets in GitHub.")
+            show_mismatch_section = False
+        elif airtable_count == 0 and clarity_count > 0:
+            data_status = ("Airtable: NOT RETURNING DATA (0 records)\n"
+                          "    Clarity: CONNECTED (" + str(clarity_count) + " records)\n"
+                          "    NOTE: Comparison skipped - Airtable has no data to compare against.\n"
+                          "    ACTION: Verify AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME secrets in GitHub.")
+            show_mismatch_section = False
+        else:
+            data_status = ("Airtable: NOT RETURNING DATA (0 records)\n"
+                          "    Clarity: NOT RETURNING DATA (0 records)\n"
+                          "    ACTION: Check all GitHub Secrets - AIRTABLE_API_TOKEN, AIRTABLE_BASE_ID,\n"
+                          "    AIRTABLE_TABLE_NAME, CLARITY_BASE_URL_1..5, CLARITY_TOKEN_1..5")
+            show_mismatch_section = False
 
         def build_airtable_mismatch(records, max_display=15):
             if not records:
@@ -471,7 +525,29 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
         clarity_mismatch_text = build_clarity_mismatch(only_in_clarity_records)
         airtable_mismatch_text = build_airtable_mismatch(only_in_airtable_records)
 
-        if comparison["difference"] > 0:
+        # --- SMART RECOMMENDATION ---
+        if airtable_count == 0 and clarity_count == 0:
+            recommendation = ("Both data sources are returning 0 records. Verify:\n"
+                "  1. AIRTABLE_API_TOKEN secret is valid\n"
+                "  2. AIRTABLE_BASE_ID secret is correct\n"
+                "  3. AIRTABLE_TABLE_NAME secret matches your table name\n"
+                "  4. CLARITY_BASE_URL_1..5 secrets point to valid API endpoints\n"
+                "  5. CLARITY_TOKEN_1..5 secrets are valid auth tokens")
+        elif airtable_count > 0 and clarity_count == 0:
+            recommendation = ("Airtable is connected (" + str(airtable_count) + " records), but Clarity API is returning 0 records.\n"
+                "ACTION NEEDED:\n"
+                "  1. Verify CLARITY_BASE_URL_1..5 secrets are correct API URLs\n"
+                "  2. Verify CLARITY_TOKEN_1..5 secrets are valid auth tokens\n"
+                "  3. Check the workflow run logs - search for 'PHASE 2' section\n"
+                "  4. Look for '[debug] HTTP XXX' and '[debug] Body preview:' lines\n"
+                "  5. Share those debug lines to identify the exact issue")
+        elif airtable_count == 0 and clarity_count > 0:
+            recommendation = ("Clarity is connected (" + str(clarity_count) + " records), but Airtable API is returning 0 records.\n"
+                "ACTION NEEDED:\n"
+                "  1. Verify AIRTABLE_API_TOKEN secret is a valid Personal Access Token\n"
+                "  2. Verify AIRTABLE_BASE_ID matches your Airtable base\n"
+                "  3. Verify AIRTABLE_TABLE_NAME matches your table name exactly")
+        elif comparison["difference"] > 0:
             recommendation = (f"Clarity has {comparison['difference']} MORE forms than Airtable. "
                 "Likely cause: some form submissions were captured by Clarity but failed to sync to Airtable. "
                 "Action: review the unmatched Clarity records below, then check Airtable's webhook/integration health.")
@@ -489,7 +565,7 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
             v = fields.get("isSpam")
             if v and str(v).lower() == "true":
                 spam_count += 1
-        non_spam_count = comparison["airtable_count"] - spam_count
+        non_spam_count = airtable_count - spam_count
 
         source_counts = {}
         for r in airtable_records:
@@ -512,6 +588,28 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
         if len(clarity_sample) > 2000:
             clarity_sample = clarity_sample[:2000] + "\n... (truncated)"
 
+        # --- BUILD MISMATCH SECTION (smart) ---
+        if show_mismatch_section:
+            mismatch_section = f"""==================================================
+              MISMATCHED FORMS
+==================================================
+
+[A] Forms ONLY in Clarity (not in Airtable)
+    Count: {len(only_in_clarity_records)}
+{clarity_mismatch_text}
+
+[B] Forms ONLY in Airtable (not in Clarity)
+    Count: {len(only_in_airtable_records)}
+{airtable_mismatch_text}
+"""
+        else:
+            mismatch_section = """==================================================
+              DATA COMPARISON
+==================================================
+    (Skipped - at least one source returned 0 records.
+     See DATA SOURCE STATUS section above for details.)
+"""
+
         report_body = f"""DAILY ABANDONED FORMS REPORT
 ==================================================
 
@@ -519,18 +617,24 @@ Report Date Range  : {window_start} -> {window_end}
                    (Karachi time, 9 AM to next-day 9 AM)
 Report Generated   : {date_str}
 Generated By       : Daily Forms Bot (GitHub Actions)
+Auto-Schedule      : Daily at 9 AM Karachi (cron: 0 4 * * * UTC)
 
 ==================================================
                 SUMMARY
 ==================================================
-Airtable Total Forms           : {comparison['airtable_count']}
+Airtable Total Forms           : {airtable_count}
   - Spam (isSpam=true)         : {spam_count}
   - Non-spam                   : {non_spam_count}
-Clarity Total Forms             : {comparison['clarity_count']}
+Clarity Total Forms             : {clarity_count}
 Difference (Clarity - Airtable) : {comparison['difference']}
 
 Airtable Unique IDs : {comparison.get('airtable_unique_ids', 'N/A')}
 Clarity Unique IDs  : {comparison.get('clarity_unique_ids', 'N/A')}
+
+==================================================
+              DATA SOURCE STATUS
+==================================================
+{data_status}
 
 ==================================================
         AIRTABLE BREAKDOWN (by Source)
@@ -542,18 +646,7 @@ Clarity Unique IDs  : {comparison.get('clarity_unique_ids', 'N/A')}
 ==================================================
 {project_breakdown}
 
-==================================================
-              MISMATCHED FORMS
-==================================================
-
-[A] Forms ONLY in Clarity (not in Airtable)
-    Count: {len(only_in_clarity_records)}
-{clarity_mismatch_text}
-
-[B] Forms ONLY in Airtable (not in Clarity)
-    Count: {len(only_in_airtable_records)}
-{airtable_mismatch_text}
-
+{mismatch_section}
 ==================================================
               RECOMMENDATION
 ==================================================
@@ -619,10 +712,15 @@ from the workflow run page.
         return False
 
 
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
 def main():
     print("=" * 60)
     print("  DAILY ABANDONED FORMS REPORT GENERATOR")
     print("  Timezone: Asia/Karachi (UTC+5)")
+    print("  Auto-Schedule: Daily 9 AM Karachi (cron: 0 4 * * * UTC)")
     print("=" * 60)
 
     start_time, end_time = get_time_window()
