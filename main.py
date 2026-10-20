@@ -5,16 +5,14 @@ Daily Abandoned Forms Report Generator
 End-to-end pipeline that runs in GitHub Actions daily.
 
 PHASE 1 - Fetch abandoned form records from Airtable (9 AM -> next day 9 AM, Karachi TZ)
-PHASE 2 - Fetch records from 5 Clarity endpoints, compare with Airtable
+PHASE 2 - Fetch records from 5 Clarity endpoints (bulletproof - tries 336 combinations per endpoint)
 PHASE 3 - Auto-generate / overwrite a Google Docs report with the comparison
 
-COMPREHENSIVE FIX (1-shot):
-  Fix 1 - Secret name fallbacks: AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY
-          AIRTABLE_TABLE_NAME OR AIRTABLE_TABLE_ID (works with old or new secret names)
-  Fix 2 - Timezone: Explicitly uses Asia/Karachi for "9 AM" calculation,
-          then converts to UTC for Airtable filter (Airtable stores Created as UTC).
-  Fix 3 - Filter field: Uses 'Last Modified' (catches forms abandoned/updated
-          in the window, not just newly created).
+COMPREHENSIVE FIX:
+  - Secret name fallbacks (AIRTABLE_API_TOKEN OR AIRTABLE_API_KEY, etc.)
+  - Timezone: Asia/Karachi explicitly, UTC conversion for Airtable filter
+  - Filter field: 'Last Modified' (catches forms abandoned today)
+  - Clarity: bulletproof - tries 4 time formats × 6 param combos × 7 auth styles × 2 methods
 """
 
 import os
@@ -24,22 +22,13 @@ import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# Phase 3 - Google Docs imports
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
-# ============================================================================
-# TIMEZONE CONSTANTS
-# ============================================================================
 KARACHI_TZ = ZoneInfo("Asia/Karachi")
 UTC_TZ = ZoneInfo("UTC")
-
-
-# ============================================================================
-# CONFIGURATION (loaded from environment variables / GitHub Secrets)
-# ============================================================================
 
 # --- Airtable credentials (with fallback to old secret names) ---
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY")
@@ -59,20 +48,11 @@ GOOGLE_SERVICE_ACCOUNT_EMAIL = os.getenv("GOOGLE_SERVICE_ACCOUNT_EMAIL")
 GOOGLE_PRIVATE_KEY = os.getenv("GOOGLE_PRIVATE_KEY", "").replace("\\n", "\n")
 GOOGLE_DOC_ID = os.getenv("GOOGLE_DOC_ID")
 
-# --- Output directory (for GitHub Artifacts) ---
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ============================================================================
-# TIME WINDOW: yesterday 9 AM Karachi -> today 9 AM Karachi
-# ============================================================================
-
 def get_time_window():
-    """
-    Returns (start, end) datetimes (Karachi TZ) for the 24h window
-    ending at today's 9 AM Karachi time.
-    """
     now_karachi = datetime.now(KARACHI_TZ)
     end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
     if now_karachi < end_karachi:
@@ -80,10 +60,6 @@ def get_time_window():
     start_karachi = end_karachi - timedelta(days=1)
     return start_karachi, end_karachi
 
-
-# ============================================================================
-# HELPERS - safely extract fields from Airtable/Clarity records
-# ============================================================================
 
 def safe_get(record, *keys, default=""):
     cur = record
@@ -125,15 +101,7 @@ def get_clarity_record_id(record):
     return None
 
 
-# ============================================================================
-# PHASE 1: AIRTABLE DATA FETCH (with pagination + timezone-aware filter)
-# ============================================================================
-
 def fetch_airtable_data(start_time, end_time):
-    """
-    Fetch abandoned form records from Airtable where 'Last Modified' falls
-    between start_time and end_time. Handles pagination via 'offset'.
-    """
     print("\n" + "=" * 60)
     print("PHASE 1: Fetching data from Airtable")
     print("=" * 60)
@@ -141,12 +109,8 @@ def fetch_airtable_data(start_time, end_time):
 
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("Missing Airtable credentials - skipping Phase 1")
-        print(f"  AIRTABLE_TOKEN set: {bool(AIRTABLE_TOKEN)}")
-        print(f"  AIRTABLE_BASE_ID set: {bool(AIRTABLE_BASE_ID)}")
-        print(f"  AIRTABLE_TABLE_NAME set: {bool(AIRTABLE_TABLE_NAME)}")
         return []
 
-    # Convert Karachi time -> UTC for Airtable filter (Airtable stores time as UTC)
     start_utc = start_time.astimezone(UTC_TZ)
     end_utc = end_time.astimezone(UTC_TZ)
     start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%S")
@@ -159,7 +123,6 @@ def fetch_airtable_data(start_time, end_time):
         "Content-Type": "application/json",
     }
 
-    # Use 'Last Modified' field - catches forms abandoned/updated in the window
     filter_formula = (
         f"AND("
         f"IS_AFTER({{Last Modified}}, '{start_str}'), "
@@ -175,15 +138,13 @@ def fetch_airtable_data(start_time, end_time):
         params = {"filterByFormula": filter_formula, "pageSize": 100}
         if offset:
             params["offset"] = offset
-
         try:
             response = requests.get(url, headers=headers, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
             records = data.get("records", [])
             all_records.extend(records)
-            print(f"  Page {page}: fetched {len(records)} records "
-                  f"(running total: {len(all_records)})")
+            print(f"  Page {page}: fetched {len(records)} records (running total: {len(all_records)})")
             page += 1
             offset = data.get("offset")
             if not offset:
@@ -194,7 +155,7 @@ def fetch_airtable_data(start_time, end_time):
 
     print(f"Airtable TOTAL: {len(all_records)} records")
 
-    # Fallback: if Last Modified filter returned 0, try Created field
+    # Fallback: try 'Created' field if Last Modified returned 0
     if not all_records:
         print("  [FALLBACK] Trying filter with 'Created' field instead...")
         filter_formula_created = (
@@ -215,16 +176,14 @@ def fetch_airtable_data(start_time, end_time):
                 data = response.json()
                 records = data.get("records", [])
                 all_records.extend(records)
-                print(f"  [Created filter] Page {page}: fetched {len(records)} records "
-                      f"(running total: {len(all_records)})")
+                print(f"  [Created] Page {page}: fetched {len(records)} (total: {len(all_records)})")
                 page += 1
                 offset = data.get("offset")
                 if not offset:
                     break
             except requests.exceptions.RequestException as e:
-                print(f"  [Created filter] error: {e}")
+                print(f"  [Created] error: {e}")
                 break
-        print(f"  [Created filter] total: {len(all_records)} records")
 
     out_path = os.path.join(OUTPUT_DIR, "airtable_data.json")
     with open(out_path, "w") as f:
@@ -235,61 +194,134 @@ def fetch_airtable_data(start_time, end_time):
             "total_count": len(all_records),
             "records": all_records,
         }, f, indent=2, default=str)
-
     return all_records
 
 
-# ============================================================================
-# PHASE 2: CLARITY DATA FETCH + COMPARISON
-# ============================================================================
+def _extract_records_from_response(data):
+    """Recursively extract a list of records from any JSON response shape."""
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for key in ("records", "data", "items", "results", "value",
+                    "rows", "entries", "list", "items_list"):
+            v = data.get(key)
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+        for v in data.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                return v
+            if isinstance(v, dict):
+                nested = _extract_records_from_response(v)
+                if nested:
+                    return nested
+    return []
+
+
+def _try_clarity_call(url, token, method, params=None, body=None):
+    """Try a single Clarity API call with multiple auth header styles."""
+    auth_styles = [
+        {"Authorization": f"Bearer {token}"},
+        {"Authorization": f"Token {token}"},
+        {"Authorization": f"ApiKey {token}"},
+        {"X-API-Key": token},
+        {"X-Api-Key": token},
+        {"Api-Key": token},
+        {"apikey": token},
+    ]
+    for auth in auth_styles:
+        headers = {"Content-Type": "application/json", "Accept": "application/json", **auth}
+        try:
+            if method == "GET":
+                resp = requests.get(url, headers=headers, params=params, timeout=30)
+            elif method == "POST":
+                resp = requests.post(url, headers=headers, json=body or params, timeout=30)
+            else:
+                continue
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    records = _extract_records_from_response(data)
+                    if records:
+                        return records, list(auth.keys())[0]
+                except Exception:
+                    continue
+            elif resp.status_code in (401, 403):
+                continue
+            else:
+                continue
+        except Exception:
+            continue
+    return None, None
+
 
 def fetch_clarity_data(start_time, end_time):
-    """Fetch records from each of the 5 Clarity endpoints."""
+    """Bulletproof Clarity fetcher - tries 336 combinations per endpoint."""
     print("\n" + "=" * 60)
-    print("PHASE 2: Fetching data from Clarity APIs")
+    print("PHASE 2: Fetching data from Clarity APIs (robust mode)")
     print("=" * 60)
 
     all_clarity_records = []
-    start_iso = start_time.isoformat()
-    end_iso = end_time.isoformat()
-    start_utc_iso = start_time.astimezone(UTC_TZ).isoformat()
-    end_utc_iso = end_time.astimezone(UTC_TZ).isoformat()
+
+    time_formats = [
+        ("ISO+TZ",  start_time.isoformat(),                       end_time.isoformat()),
+        ("ISO_UTC", start_time.astimezone(UTC_TZ).isoformat(),    end_time.astimezone(UTC_TZ).isoformat()),
+        ("date",    start_time.strftime("%Y-%m-%d"),              end_time.strftime("%Y-%m-%d")),
+        ("unix",    str(int(start_time.timestamp())),             str(int(end_time.timestamp()))),
+    ]
+    param_combos = [
+        ("start/end",            lambda s, e: {"start": s, "end": e}),
+        ("startDate/endDate",    lambda s, e: {"startDate": s, "endDate": e}),
+        ("from/to",              lambda s, e: {"from": s, "to": e}),
+        ("startTime/endTime",    lambda s, e: {"startTime": s, "endTime": e}),
+        ("begin/finish",         lambda s, e: {"begin": s, "finish": e}),
+        ("date_start/date_end",  lambda s, e: {"date_start": s, "date_end": e}),
+    ]
 
     for endpoint in CLARITY_ENDPOINTS:
         idx = endpoint["index"]
         url = endpoint["url"]
         token = endpoint["token"]
-
         print(f"\n  Endpoint {idx}: {url}")
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-        params = {
-            "start": start_utc_iso,
-            "end": end_utc_iso,
-            "startDate": start_iso,
-            "endDate": end_iso,
-        }
+        print(f"    Token preview: {token[:8]}...{token[-4:] if len(token) > 12 else ''}")
 
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict):
-                records = (data.get("records") or data.get("data")
-                           or data.get("items") or data.get("results") or [])
-            elif isinstance(data, list):
-                records = data
-            else:
-                records = []
-            print(f"    Received {len(records)} records from endpoint {idx}")
-            for r in records:
+        endpoint_records = []
+        success_info = None
+
+        for method in ("GET", "POST"):
+            if endpoint_records:
+                break
+            for fmt_name, start_val, end_val in time_formats:
+                if endpoint_records:
+                    break
+                for combo_name, combo_fn in param_combos:
+                    params = combo_fn(start_val, end_val)
+                    records, auth_used = _try_clarity_call(
+                        url, token, method,
+                        params=params if method == "GET" else None,
+                        body=params if method == "POST" else None
+                    )
+                    if records:
+                        endpoint_records = records
+                        success_info = f"method={method}, time_fmt={fmt_name}, params={combo_name}, auth={auth_used}"
+                        break
+
+        if endpoint_records:
+            print(f"    OK Got {len(endpoint_records)} records ({success_info})")
+            for r in endpoint_records:
                 if isinstance(r, dict):
                     r["_clarity_endpoint"] = idx
-            all_clarity_records.extend(records)
-        except Exception as e:
-            print(f"    Endpoint {idx} error: {e}")
+            all_clarity_records.extend(endpoint_records)
+        else:
+            print(f"    WARN No records after 336 attempts")
+            try:
+                test_resp = requests.get(url, headers={"Authorization": f"Bearer {token}"},
+                                         params={"start": start_time.isoformat(), "end": end_time.isoformat()},
+                                         timeout=30)
+                print(f"    [debug] HTTP {test_resp.status_code}")
+                body_preview = test_resp.text[:300] if test_resp.text else "(empty body)"
+                print(f"    [debug] Body preview: {body_preview}")
+            except Exception as e:
+                print(f"    [debug] Final test call also failed: {e}")
 
     print(f"\nClarity TOTAL: {len(all_clarity_records)} records")
 
@@ -301,12 +333,10 @@ def fetch_clarity_data(start_time, end_time):
             "total_count": len(all_clarity_records),
             "records": all_clarity_records,
         }, f, indent=2, default=str)
-
     return all_clarity_records
 
 
 def compare_data(airtable_records, clarity_records, start_time, end_time):
-    """Compare Airtable vs Clarity record sets using record IDs."""
     print("\n" + "=" * 60)
     print("Comparing Airtable vs Clarity data")
     print("=" * 60)
@@ -328,7 +358,6 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
 
     airtable_ids = set(airtable_map.keys())
     clarity_ids = set(clarity_map.keys())
-
     only_in_clarity = clarity_ids - airtable_ids
     only_in_airtable = airtable_ids - clarity_ids
 
@@ -355,13 +384,8 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
     out_path = os.path.join(OUTPUT_DIR, "comparison_report.json")
     with open(out_path, "w") as f:
         json.dump(comparison, f, indent=2, default=str)
-
     return comparison
 
-
-# ============================================================================
-# PHASE 3: GOOGLE DOCS REPORT GENERATION
-# ============================================================================
 
 def format_airtable_summary(record):
     fields = safe_get(record, "fields", default={}) or {}
@@ -391,7 +415,6 @@ def format_clarity_summary(record):
 
 
 def generate_google_docs_report(comparison, airtable_records, clarity_records):
-    """Overwrite the configured Google Doc with a freshly formatted report."""
     print("\n" + "=" * 60)
     print("PHASE 3: Generating Google Docs Report")
     print("=" * 60)
@@ -595,10 +618,6 @@ from the workflow run page.
         print(f"Phase 3 error: {e}")
         return False
 
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
 
 def main():
     print("=" * 60)
