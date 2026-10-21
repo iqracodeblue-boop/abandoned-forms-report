@@ -445,7 +445,12 @@ def generate_google_docs_report(comparison, airtable_records, clarity_records):
         return False
 
     try:
-        SCOPES = ["https://www.googleapis.com/auth/documents"]
+               # CRITICAL FIX: Added 'drive' scope to fix 403 "insufficient authentication scopes" error
+        # Without drive scope, the rename call (drive_service.files().update) fails
+        SCOPES = [
+            "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/drive"
+        ]
         creds = service_account.Credentials.from_service_account_info(
             {
                 "client_email": GOOGLE_SERVICE_ACCOUNT_EMAIL,
