@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Daily Abandoned Forms Report Generator (TEXT VERSION - NO GOOGLE DOCS)
+Daily Abandoned Forms Report Generator (MULTI-BRAND TEXT VERSION)
 =====================================================================
-Sir's requirement: Daily report as TEXT FILE (not Google Docs).
-Single Clarity API endpoint with token as query parameter (Laravel-style).
+Generates 4 SEPARATE brand reports (Quick Signage, Signs.inc, Signage.inc, SignMakerz)
+Each report shows Airtable data for that brand + Clarity comparison + session links.
 
 Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
 """
@@ -29,19 +29,43 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY"
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME") or os.getenv("AIRTABLE_TABLE_ID")
 
-# --- Clarity API (single endpoint with token as query parameter) ---
-# URL provided by Sir: https://clarity.signage.inc/api/v1/internal/abandoned-forms
-# Token is sent as ?api_token= query parameter (Laravel-style API)
-# Override via GitHub secrets CLARITY_BASE_URL and CLARITY_API_TOKEN
-CLARITY_BASE_URL = os.getenv(
-    "CLARITY_BASE_URL",
-    "https://clarity.signage.inc/api/v1/internal/abandoned-forms"
-)
-CLARITY_API_TOKEN = os.getenv(
-    "CLARITY_API_TOKEN",
-    "clarity_internal_abandoned_token_2026_sec789xyz"
-)
+# --- Clarity API (single endpoint, token as query parameter) ---
+# Uses 'or' to fall back to default if secret is empty OR not set
+CLARITY_BASE_URL = os.getenv("CLARITY_BASE_URL") or "https://clarity.signage.inc/api/v1/internal/abandoned-forms"
+CLARITY_API_TOKEN = os.getenv("CLARITY_API_TOKEN") or "clarity_internal_abandoned_token_2026_sec789xyz"
 CLARITY_PER_PAGE = 25
+
+# --- 4 Brand configurations ---
+BRANDS = [
+    {
+        "name": "Quick Signage",
+        "code": "quick_signage",
+        "url_patterns": ["quicksignage"],
+        "clarity_session_base": "https://clarity.quicksignage.com/admin/sessions/",
+        "platform": "Quick Signage Live Website",
+    },
+    {
+        "name": "Signs.inc",
+        "code": "signs_inc",
+        "url_patterns": ["signs.inc", "signs-inc"],
+        "clarity_session_base": "https://clarity.signs.inc/admin/sessions/",
+        "platform": "Signs.inc Live Website",
+    },
+    {
+        "name": "Signage.inc",
+        "code": "signage_inc",
+        "url_patterns": ["signage.inc", "signage-inc"],
+        "clarity_session_base": "https://clarity.signage.inc/admin/sessions/",
+        "platform": "Signage.inc Live Website",
+    },
+    {
+        "name": "SignMakerz",
+        "code": "sign_makerz",
+        "url_patterns": ["signmakerz"],
+        "clarity_session_base": "https://clarity.signmakerz.com/admin/sessions/",
+        "platform": "SignMakerz Live Website",
+    },
+]
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -52,7 +76,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # ============================================================================
 
 def get_time_window():
-    """Returns (start, end) datetimes in Karachi TZ for 24h window ending today 9 AM."""
     now_karachi = datetime.now(KARACHI_TZ)
     end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
     if now_karachi < end_karachi:
@@ -116,6 +139,33 @@ def format_date_range_human(start_time, end_time):
     return f"{s} to {e}"
 
 
+def detect_brand_from_url(page_url):
+    """Detect brand from Page URL by matching brand patterns."""
+    if not page_url:
+        return "Unknown"
+    url = str(page_url).lower()
+    for brand in BRANDS:
+        for pattern in brand["url_patterns"]:
+            if pattern.lower() in url:
+                return brand["name"]
+    return "Unknown"
+
+
+def build_clarity_session_url(record, brand):
+    """Build a session replay URL for a Clarity record."""
+    # Try direct session_url field first
+    for field in ("session_url", "sessionUrl", "replay_url", "replayUrl", "clarity_url", "url"):
+        v = record.get(field) if isinstance(record, dict) else None
+        if v and str(v).startswith("http"):
+            return str(v)
+    # Try session_id field - build URL using brand's session base
+    for field in ("session_id", "sessionId", "session", "id"):
+        v = record.get(field) if isinstance(record, dict) else None
+        if v:
+            return f"{brand['clarity_session_base']}{v}"
+    return "—"
+
+
 # ============================================================================
 # PHASE 1: AIRTABLE DATA FETCH
 # ============================================================================
@@ -128,9 +178,6 @@ def fetch_airtable_data(start_time, end_time):
 
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
         print("Missing Airtable credentials - skipping Phase 1")
-        print(f"  AIRTABLE_TOKEN set: {bool(AIRTABLE_TOKEN)}")
-        print(f"  AIRTABLE_BASE_ID set: {bool(AIRTABLE_BASE_ID)}")
-        print(f"  AIRTABLE_TABLE_NAME set: {bool(AIRTABLE_TABLE_NAME)}")
         return []
 
     start_utc = start_time.astimezone(UTC_TZ)
@@ -220,23 +267,18 @@ def fetch_airtable_data(start_time, end_time):
 
 
 # ============================================================================
-# PHASE 2: CLARITY DATA FETCH (single endpoint, token as query param)
+# PHASE 2: CLARITY DATA FETCH
 # ============================================================================
 
 def _extract_records_from_response(data):
-    """Recursively extract a list of records from any JSON response shape.
-    Handles Laravel-style: {"data": [...], "links": {...}, "meta": {...}}
-    """
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
-        # Laravel pagination uses "data" key
         for key in ("data", "records", "items", "results", "value",
                     "rows", "entries", "list", "items_list"):
             v = data.get(key)
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
-        # Deep recursive search
         for v in data.values():
             if isinstance(v, list) and v and isinstance(v[0], dict):
                 return v
@@ -248,9 +290,6 @@ def _extract_records_from_response(data):
 
 
 def fetch_clarity_data(start_time, end_time):
-    """Fetch from single Clarity endpoint with token as query parameter.
-    Handles Laravel-style pagination via 'meta.last_page' or 'links.next'.
-    """
     print("\n" + "=" * 60)
     print("PHASE 2: Fetching data from Clarity API")
     print("=" * 60)
@@ -264,7 +303,6 @@ def fetch_clarity_data(start_time, end_time):
     end_iso = end_time.astimezone(UTC_TZ).isoformat()
 
     while True:
-        # Build query params - token as query param (Laravel-style)
         params = {
             "per_page": CLARITY_PER_PAGE,
             "api_token": CLARITY_API_TOKEN,
@@ -274,7 +312,7 @@ def fetch_clarity_data(start_time, end_time):
         }
 
         try:
-            print(f"\n  Page {page}: GET {CLARITY_BASE_URL}?per_page={CLARITY_PER_PAGE}&page={page}&...")
+            print(f"\n  Page {page}: GET {CLARITY_BASE_URL}?per_page={CLARITY_PER_PAGE}&page={page}")
             response = requests.get(CLARITY_BASE_URL, params=params, timeout=30)
             print(f"    HTTP status: {response.status_code}")
 
@@ -290,7 +328,6 @@ def fetch_clarity_data(start_time, end_time):
                 print(f"    Got {len(records)} records (running total: {len(all_clarity_records) + len(records)})")
                 all_clarity_records.extend(records)
 
-                # Laravel-style pagination check via meta.last_page
                 if isinstance(data, dict):
                     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
                     last_page = meta.get("last_page")
@@ -300,25 +337,21 @@ def fetch_clarity_data(start_time, end_time):
                             print(f"    Reached last page ({current_page}/{last_page}) - stopping")
                             break
                     else:
-                        # No meta info - check links.next
                         links = data.get("links", {}) if isinstance(data.get("links"), dict) else {}
                         next_url = links.get("next")
                         if not next_url:
                             print(f"    No next page link - stopping")
                             break
-                    # If we got fewer records than per_page, we're on the last page
                     if len(records) < CLARITY_PER_PAGE:
                         print(f"    Got {len(records)} < {CLARITY_PER_PAGE} - last page reached")
                         break
                 elif isinstance(data, list):
                     if len(data) < CLARITY_PER_PAGE:
-                        print(f"    Got {len(data)} < {CLARITY_PER_PAGE} - last page reached")
                         break
                 else:
                     break
 
                 page += 1
-                # Safety limit
                 if page > 100:
                     print(f"    Safety limit (100 pages) reached - stopping")
                     break
@@ -360,25 +393,51 @@ def fetch_clarity_data(start_time, end_time):
 
 
 # ============================================================================
-# COMPARISON LOGIC
+# GROUPING BY BRAND
 # ============================================================================
 
-def compare_data(airtable_records, clarity_records, start_time, end_time):
-    print("\n" + "=" * 60)
-    print("Comparing Airtable vs Clarity data")
-    print("=" * 60)
+def group_airtable_records_by_brand(airtable_records):
+    brand_groups = {brand["name"]: [] for brand in BRANDS}
+    brand_groups["Unknown"] = []
+    for r in airtable_records:
+        fields = safe_get(r, "fields", default={}) or {}
+        page_url = fields.get("Page URL", "")
+        brand_name = detect_brand_from_url(page_url)
+        brand_groups[brand_name].append(r)
+    return brand_groups
 
-    airtable_count = len(airtable_records)
-    clarity_count = len(clarity_records)
+
+def group_clarity_records_by_brand(clarity_records):
+    brand_groups = {brand["name"]: [] for brand in BRANDS}
+    brand_groups["Unknown"] = []
+    for r in clarity_records:
+        if not isinstance(r, dict):
+            continue
+        url = r.get("url") or r.get("pageUrl") or r.get("page_url") or safe_get(r, "fields", "Page URL") or ""
+        brand_name = detect_brand_from_url(url)
+        if brand_name == "Unknown":
+            brand_name = "Signage.inc"
+        brand_groups[brand_name].append(r)
+    return brand_groups
+
+
+# ============================================================================
+# COMPARISON LOGIC (per brand)
+# ============================================================================
+
+def compare_brand_data(brand_name, brand_airtable_records, brand_clarity_records,
+                       start_time, end_time):
+    airtable_count = len(brand_airtable_records)
+    clarity_count = len(brand_clarity_records)
     difference = clarity_count - airtable_count
 
     airtable_map = {}
-    for r in airtable_records:
+    for r in brand_airtable_records:
         rid = get_airtable_record_id(r)
         if rid:
             airtable_map[rid] = r
     clarity_map = {}
-    for r in clarity_records:
+    for r in brand_clarity_records:
         rid = get_clarity_record_id(r)
         if rid:
             clarity_map[rid] = r
@@ -388,56 +447,37 @@ def compare_data(airtable_records, clarity_records, start_time, end_time):
     only_in_clarity = clarity_ids - airtable_ids
     only_in_airtable = airtable_ids - clarity_ids
 
-    print(f"  Airtable: {airtable_count} records ({len(airtable_ids)} unique IDs)")
-    print(f"  Clarity : {clarity_count} records ({len(clarity_ids)} unique IDs)")
-    print(f"  Difference (Clarity - Airtable): {difference}")
-
     only_in_clarity_records = [clarity_map[rid] for rid in sorted(only_in_clarity)]
     only_in_airtable_records = [airtable_map[rid] for rid in sorted(only_in_airtable)]
 
-    comparison = {
+    return {
+        "brand_name": brand_name,
         "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
         "airtable_count": airtable_count,
         "clarity_count": clarity_count,
         "difference": difference,
         "airtable_unique_ids": len(airtable_ids),
         "clarity_unique_ids": len(clarity_ids),
-        "only_in_clarity_ids": sorted(list(only_in_clarity)),
-        "only_in_airtable_ids": sorted(list(only_in_airtable)),
         "only_in_clarity_records": only_in_clarity_records,
         "only_in_airtable_records": only_in_airtable_records,
     }
 
-    out_path = os.path.join(OUTPUT_DIR, "comparison_report.json")
-    with open(out_path, "w") as f:
-        json.dump(comparison, f, indent=2, default=str)
-    return comparison
-
 
 # ============================================================================
-# PHASE 3: TEXT REPORT GENERATION (no Google Docs)
+# PER-BRAND TEXT REPORT GENERATION
 # ============================================================================
 
-def generate_text_report(comparison, airtable_records, clarity_records):
-    """Generate professional audit report as TEXT FILE (no Google Docs)."""
-    print("\n" + "=" * 60)
-    print("PHASE 3: Generating Text Report (no Google Docs)")
-    print("=" * 60)
+def generate_brand_text_report(brand, comparison, airtable_records, clarity_records,
+                                start_time, end_time):
+    brand_name = brand["name"]
+    airtable_count = comparison["airtable_count"]
+    clarity_count = comparison["clarity_count"]
+    only_in_clarity_records = comparison.get("only_in_clarity_records", [])
 
     now = datetime.now(KARACHI_TZ)
     date_str = now.strftime("%d %b %Y, %H:%M (PKT)")
-    window_start = comparison["time_window"]["start"]
-    window_end = comparison["time_window"]["end"]
-    date_range_human = format_date_range_human(
-        datetime.fromisoformat(window_start),
-        datetime.fromisoformat(window_end)
-    )
-    only_in_clarity_records = comparison.get("only_in_clarity_records", [])
-    only_in_airtable_records = comparison.get("only_in_airtable_records", [])
-    airtable_count = comparison["airtable_count"]
-    clarity_count = comparison["clarity_count"]
+    date_range_human = format_date_range_human(start_time, end_time)
 
-    # Calculate spam and non-spam
     spam_count = 0
     for r in airtable_records:
         fields = safe_get(r, "fields", default={}) or {}
@@ -446,121 +486,69 @@ def generate_text_report(comparison, airtable_records, clarity_records):
             spam_count += 1
     non_spam_count = airtable_count - spam_count
 
-    # Build source breakdown
     source_counts = {}
     for r in airtable_records:
         fields = safe_get(r, "fields", default={}) or {}
         src = fields.get("Record Source") or "Unknown"
         source_counts[src] = source_counts.get(src, 0) + 1
     source_breakdown = "\n".join(
-        f"  {src}: {cnt}"
+        f"    {src}: {cnt}"
         for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])
-    ) or "  (no source info available)"
+    ) if source_counts else "    (no source info available)"
 
-    # Build project breakdown
-    project_counts = {}
-    for r in airtable_records:
-        fields = safe_get(r, "fields", default={}) or {}
-        p = fields.get("Project") or "Unknown"
-        project_counts[p] = project_counts.get(p, 0) + 1
-    project_breakdown = "\n".join(
-        f"  {p}: {cnt}"
-        for p, cnt in sorted(project_counts.items(), key=lambda x: -x[1])
-    ) or "  (no project info available)"
+    # LEADS NOT FOUND table (with session links!)
+    if clarity_count > 0 and only_in_clarity_records:
+        leads_table = "+----------------------+--------------------------+----------------------------------------------------+\n"
+        leads_table += "| DATE & TIMESTAMP     | VISITOR EMAIL / ID       | SESSION REPLAY / VIEW LINK                         |\n"
+        leads_table += "+----------------------+--------------------------+----------------------------------------------------+\n"
+        for r in only_in_clarity_records[:30]:
+            rid = get_clarity_record_id(r) or "—"
+            ts = (r.get("timestamp") or r.get("createdAt")
+                  or r.get("created_at") or "—")
+            ts_short = truncate(str(ts), 20)
+            email = (r.get("email") or r.get("visitor_email")
+                     or r.get("user_email") or safe_get(r, "fields", "Email") or "—")
+            email_short = truncate(str(email), 24)
+            session_url = build_clarity_session_url(r, brand)
+            session_url_short = truncate(session_url, 50)
+            leads_table += f"| {ts_short:<20} | {email_short:<24} | {session_url_short:<50} |\n"
+        leads_table += "+----------------------+--------------------------+----------------------------------------------------+\n"
+        if len(only_in_clarity_records) > 30:
+            leads_table += f"\n    ... and {len(only_in_clarity_records) - 30} more records (see artifact JSON for full list)\n"
+    elif clarity_count > 0 and not only_in_clarity_records:
+        leads_table = "    All Clarity records are also present in Airtable. No missing leads.\n"
+    else:
+        leads_table = "    (Clarity API not returning data for this brand.\n"
+        leads_table += "     Once Clarity API is connected, this section will display a table\n"
+        leads_table += "     of records captured by Clarity but missing from Airtable,\n"
+        leads_table += "     along with session replay links.)\n"
 
-    # Build recommendation
+    # Recommendation
     if airtable_count == 0 and clarity_count == 0:
-        recommendation = """Both data sources are returning 0 records.
-
-Recommended Actions:
-  1. Verify AIRTABLE_API_TOKEN secret is valid
-  2. Verify AIRTABLE_BASE_ID secret is correct
-  3. Verify AIRTABLE_TABLE_NAME secret matches your table name
-  4. Verify CLARITY_BASE_URL secret points to valid API endpoint
-  5. Verify CLARITY_API_TOKEN secret is valid"""
+        recommendation = "Both data sources are returning 0 records for this brand."
     elif airtable_count > 0 and clarity_count == 0:
-        recommendation = f"""Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.
-
-Recommended Actions:
-  1. Verify CLARITY_BASE_URL secret is correct API URL
-     Current: {CLARITY_BASE_URL}
-  2. Verify CLARITY_API_TOKEN secret is valid auth token
-     Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}
-  3. Check the workflow run logs above - search for 'PHASE 2' section
-  4. Look for 'HTTP status:' line to see actual response code
-  5. Look for 'Body:' preview to see actual response content"""
+        recommendation = f"Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.\n\nRecommended Actions:\n  1. Verify CLARITY_BASE_URL secret is correct API URL\n     Current: {CLARITY_BASE_URL}\n  2. Verify CLARITY_API_TOKEN secret is valid auth token\n     Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}\n  3. Check the workflow run logs above - search for 'PHASE 2' section"
     elif airtable_count == 0 and clarity_count > 0:
-        recommendation = f"""Clarity is connected ({clarity_count} records), but Airtable API is returning 0 records.
-
-Recommended Actions:
-  1. Verify AIRTABLE_API_TOKEN secret is a valid Personal Access Token
-  2. Verify AIRTABLE_BASE_ID matches your Airtable base
-  3. Verify AIRTABLE_TABLE_NAME matches your table name exactly"""
+        recommendation = f"Clarity is connected ({clarity_count} records), but Airtable API is returning 0 records."
     elif comparison["difference"] > 0:
-        recommendation = f"""Clarity has {comparison['difference']} MORE forms than Airtable.
-
-Likely cause: Some form submissions were captured by Clarity but failed to sync to Airtable.
-
-Recommended Action: Review the unmatched Clarity records in Section 3, then check
-Airtable's webhook and integration health."""
+        recommendation = f"Clarity has {comparison['difference']} MORE forms than Airtable for this brand.\n\nLikely cause: Some form submissions were captured by Clarity but failed to sync to Airtable.\n\nRecommended Action: Review the unmatched Clarity records in Section 3 above (with session replay links),\nthen check Airtable's webhook and integration health."
     elif comparison["difference"] < 0:
-        recommendation = f"""Airtable has {abs(comparison['difference'])} MORE forms than Clarity.
-
-Likely cause: Stale records in Airtable, or Clarity's date filter is excluding valid sessions.
-
-Recommended Action: Verify Airtable entries match today's window, and confirm Clarity's
-date filter is inclusive of the 9 AM to 9 AM window."""
+        recommendation = f"Airtable has {abs(comparison['difference'])} MORE forms than Clarity for this brand."
     else:
-        recommendation = """Both sources match perfectly in record count.
+        recommendation = "Both sources match perfectly in record count for this brand."
 
-Recommended Action: Check the unique-ID comparison to confirm every individual form
-matches, not just the totals."""
+    report_body = f"""{brand_name} Abandoned Forms & Leads Verification Report
+{'=' * 100}
 
-    # Build leads not found table
-    if airtable_count > 0 and clarity_count > 0:
-        leads_section = "3. LEADS THAT ARE NOT FOUND IN AIRTABLE\n"
-        leads_section += "-" * 80 + "\n"
-        leads_section += "DATE & TIMESTAMP    | VISITOR EMAIL / IDENTIFIER  | SESSION REPLAY / VIEW LINK\n"
-        leads_section += "-" * 80 + "\n"
-
-        if only_in_clarity_records:
-            for r in only_in_clarity_records[:30]:
-                rid = get_clarity_record_id(r) or "—"
-                ts = (r.get("timestamp") or r.get("createdAt")
-                      or r.get("created_at") or "—")
-                ts_short = truncate(str(ts), 18)
-                url = truncate(r.get("url") or r.get("pageUrl")
-                              or safe_get(r, "fields", "Page URL") or "—", 40)
-                leads_section += f"{ts_short:<20}| {str(rid)[:25]:<27} | {url}\n"
-            if len(only_in_clarity_records) > 30:
-                leads_section += f"\n... and {len(only_in_clarity_records) - 30} more records\n"
-        else:
-            leads_section += "  None - all Clarity forms have matching Airtable records.\n"
-        leads_section += "\n"
-    else:
-        leads_section = "3. LEADS THAT ARE NOT FOUND IN AIRTABLE\n"
-        leads_section += "-" * 80 + "\n"
-        if clarity_count == 0:
-            leads_section += "(Section skipped - Clarity API not returning data for comparison.\n"
-            leads_section += " Once Clarity API is connected and returns data, this section\n"
-            leads_section += " will display a table of records captured by Clarity but missing\n"
-            leads_section += " from Airtable.)\n\n"
-        else:
-            leads_section += "(Section skipped - Airtable API not returning data for comparison.)\n\n"
-
-    # Build full text report
-    report_body = f"""Quick Signage Abandoned Forms & Leads Verification Report
-{'=' * 80}
-
-Report Title:    Quick Signage Abandoned Forms & Dashboard Verification Report
+Report Title:    {brand_name} Abandoned Forms & Dashboard Verification Report
 Date Range:      {date_range_human}
 Prepared By:     Iqra Kashif
-Audited Platform: Quick Signage Live Website, Airtable, and Internal Dashboard
+Audited Platform: {brand['platform']}, Airtable, and Internal Dashboard
 
 1. Executive Summary
-{'-' * 80}
+{'-' * 100}
 This professional audit report reviews the data integrity and synchronization status
-between the live Quick Signage website frontend, abandoned forms capture system,
+between the live {brand_name} website frontend, abandoned forms capture system,
 Airtable database, and the internal admin dashboard. The evaluation period covers
 {date_range_human}.
 
@@ -569,7 +557,7 @@ inputs, and abandoned form session data are accurately flowing into Airtable and
 reflecting correctly on the internal dashboard.
 
 2. Audit Scope & Verification Methodology
-{'-' * 80}
+{'-' * 100}
 During the specified 24-hour window, the following pipeline verification steps were
 executed:
 
@@ -582,9 +570,11 @@ executed:
   - Dashboard Data Reconciliation: Cross-referenced Airtable records against
     internal dashboard panels to confirm real-time updates.
 
-{leads_section}
+3. LEADS THAT ARE NOT FOUND IN AIRTABLE
+{'-' * 100}
+{leads_table}
 4. Data Summary
-{'-' * 80}
+{'-' * 100}
   Airtable Total Forms:            {airtable_count}
   Spam (isSpam=true):               {spam_count}
   Non-spam:                         {non_spam_count}
@@ -595,50 +585,94 @@ executed:
   Clarity Unique IDs:   {comparison.get('clarity_unique_ids', 'N/A')}
 
 5. Data Source Status
-{'-' * 80}
+{'-' * 100}
   Airtable:   {"CONNECTED" if airtable_count > 0 else "NOT RETURNING DATA"} ({airtable_count} records)
   Clarity:    {"CONNECTED" if clarity_count > 0 else "NOT RETURNING DATA"} ({clarity_count} records)
   Endpoint:   {CLARITY_BASE_URL}
 
 6. Airtable Breakdown (by Source)
-{'-' * 80}
+{'-' * 100}
 {source_breakdown}
 
-7. Airtable Breakdown (by Project)
-{'-' * 80}
-{project_breakdown}
-
-8. Recommendation
-{'-' * 80}
+7. Recommendation
+{'-' * 100}
 {recommendation}
 
-{'=' * 80}
-End of Report - Quick Signage QA
-{'=' * 80}
+{'=' * 100}
+End of Report - {brand_name} QA
+{'=' * 100}
 
 Report Generated:   {date_str}
 Auto-Schedule:      Daily at 9 AM Karachi (cron: 0 4 * * * UTC)
 Generated By:       GitHub Actions Automation
 """
 
-    # Save the text report
     today_str = now.strftime("%Y-%m-%d")
-    txt_filename = f"quick_signage_report_{today_str}.txt"
+    txt_filename = f"{brand['code']}_report_{today_str}.txt"
     out_path = os.path.join(OUTPUT_DIR, txt_filename)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(report_body)
 
-    # Also save as a fixed filename for easy access
-    latest_path = os.path.join(OUTPUT_DIR, "daily_report.txt")
-    with open(latest_path, "w", encoding="utf-8") as f:
-        f.write(report_body)
-
-    print(f"  Report saved to:")
-    print(f"    - {out_path}")
-    print(f"    - {latest_path} (latest)")
-    print(f"  File size: {os.path.getsize(out_path):,} bytes")
-    print(f"  Report length: {len(report_body):,} chars")
+    print(f"    Saved: {txt_filename} ({os.path.getsize(out_path):,} bytes)")
     return out_path
+
+
+def generate_all_brand_reports(airtable_records, clarity_records, start_time, end_time):
+    print("\n" + "=" * 60)
+    print("PHASE 3: Generating 4 Brand Reports (TEXT FILES)")
+    print("=" * 60)
+
+    airtable_by_brand = group_airtable_records_by_brand(airtable_records)
+    clarity_by_brand = group_clarity_records_by_brand(clarity_records)
+
+    print(f"\n  Airtable records by brand:")
+    for brand in BRANDS:
+        print(f"    {brand['name']}: {len(airtable_by_brand[brand['name']])} records")
+    print(f"    Unknown: {len(airtable_by_brand['Unknown'])} records")
+
+    print(f"\n  Clarity records by brand:")
+    for brand in BRANDS:
+        print(f"    {brand['name']}: {len(clarity_by_brand[brand['name']])} records")
+
+    report_paths = []
+    for brand in BRANDS:
+        brand_name = brand["name"]
+        brand_airtable = airtable_by_brand[brand_name]
+        brand_clarity = clarity_by_brand[brand_name]
+
+        print(f"\n  Generating report for: {brand_name}")
+        print(f"    Airtable: {len(brand_airtable)} records")
+        print(f"    Clarity:  {len(brand_clarity)} records")
+
+        comparison = compare_brand_data(
+            brand_name, brand_airtable, brand_clarity, start_time, end_time
+        )
+        path = generate_brand_text_report(
+            brand, comparison, brand_airtable, brand_clarity, start_time, end_time
+        )
+        report_paths.append(path)
+
+    summary = {
+        "report_date": datetime.now(KARACHI_TZ).isoformat(),
+        "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
+        "total_airtable_records": len(airtable_records),
+        "total_clarity_records": len(clarity_records),
+        "brand_breakdown": {
+            brand["name"]: {
+                "airtable_count": len(airtable_by_brand[brand["name"]]),
+                "clarity_count": len(clarity_by_brand[brand["name"]]),
+            }
+            for brand in BRANDS
+        },
+        "unknown_records": len(airtable_by_brand["Unknown"]),
+        "reports_generated": [os.path.basename(p) for p in report_paths],
+    }
+    summary_path = os.path.join(OUTPUT_DIR, "report_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    print(f"\n  Summary saved: report_summary.json")
+    return report_paths
 
 
 # ============================================================================
@@ -647,10 +681,11 @@ Generated By:       GitHub Actions Automation
 
 def main():
     print("=" * 60)
-    print("  QUICK SIGNAGE ABANDONED FORMS REPORT GENERATOR")
+    print("  MULTI-BRAND ABANDONED FORMS REPORT GENERATOR")
+    print("  Brands: Quick Signage | Signs.inc | Signage.inc | SignMakerz")
     print("  Timezone: Asia/Karachi (UTC+5)")
     print("  Auto-Schedule: Daily 9 AM Karachi (cron: 0 4 * * * UTC)")
-    print("  Output: TEXT FILE (no Google Docs)")
+    print("  Output: 4 TEXT FILES (no Google Docs)")
     print("=" * 60)
 
     start_time, end_time = get_time_window()
@@ -658,21 +693,24 @@ def main():
 
     airtable_records = fetch_airtable_data(start_time, end_time)
     clarity_records = fetch_clarity_data(start_time, end_time)
-    comparison = compare_data(airtable_records, clarity_records, start_time, end_time)
-    report_path = generate_text_report(comparison, airtable_records, clarity_records)
+    report_paths = generate_all_brand_reports(
+        airtable_records, clarity_records, start_time, end_time
+    )
 
     print("\n" + "=" * 60)
     print("  ALL PHASES COMPLETED")
     print("=" * 60)
+    print(f"\nGenerated {len(report_paths)} brand reports in ./{OUTPUT_DIR}/:")
+    for path in report_paths:
+        size = os.path.getsize(path)
+        print(f"  - {os.path.basename(path)} ({size:,} bytes)")
+
     print(f"\nOutput files in ./{OUTPUT_DIR}/:")
     for fname in sorted(os.listdir(OUTPUT_DIR)):
         fpath = os.path.join(OUTPUT_DIR, fname)
         if os.path.isfile(fpath):
             size = os.path.getsize(fpath)
             print(f"  - {fname} ({size:,} bytes)")
-
-    print(f"\n  LATEST REPORT:")
-    print(f"  ./{OUTPUT_DIR}/daily_report.txt")
 
     return 0
 
