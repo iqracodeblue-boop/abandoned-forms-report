@@ -8,13 +8,11 @@ on:
 env:
   PYTHON_VERSION: '3.11'
   TZ: 'Asia/Karachi'
-  # --- Airtable ---
   AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
   AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
   AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
   AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
   AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-  # --- Clarity (single endpoint, token as query param) ---
   CLARITY_BASE_URL: ${{ secrets.CLARITY_BASE_URL }}
   CLARITY_API_TOKEN: ${{ secrets.CLARITY_API_TOKEN }}
 
@@ -38,15 +36,42 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Data Fetch & Report Generator
+      - name: Run Data Fetch & Generate 4 Brand Reports
         run: python main.py
 
-      - name: Upload Daily Report (Text File)
+      - name: Upload Quick Signage Report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: daily-report
-          path: output/daily_report.txt
+          name: quick-signage-report
+          path: output/quick_signage_report_*.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Signs.inc Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signs-inc-report
+          path: output/signs_inc_report_*.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload Signage.inc Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signage-inc-report
+          path: output/signage_inc_report_*.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload SignMakerz Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: signmakerz-report
+          path: output/sign_makerz_report_*.txt
           retention-days: 30
           if-no-files-found: warn
 
@@ -68,11 +93,11 @@ jobs:
           retention-days: 14
           if-no-files-found: warn
 
-      - name: Upload Comparison Report Artifact
+      - name: Upload Report Summary
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: comparison-report
-          path: output/comparison_report.json
-          retention-days: 14
+          name: report-summary
+          path: output/report_summary.json
+          retention-days: 30
           if-no-files-found: warn
