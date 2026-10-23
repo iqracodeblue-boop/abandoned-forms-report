@@ -7,25 +7,16 @@ on:
 
 env:
   PYTHON_VERSION: '3.11'
-  TZ: 'Asia/Karachi'      # Belt-and-suspenders: set system TZ too
+  TZ: 'Asia/Karachi'
+  # --- Airtable ---
   AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
   AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
   AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
   AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
   AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-  CLARITY_BASE_URL_1: ${{ secrets.CLARITY_BASE_URL_1 }}
-  CLARITY_TOKEN_1: ${{ secrets.CLARITY_TOKEN_1 }}
-  CLARITY_BASE_URL_2: ${{ secrets.CLARITY_BASE_URL_2 }}
-  CLARITY_TOKEN_2: ${{ secrets.CLARITY_TOKEN_2 }}
-  CLARITY_BASE_URL_3: ${{ secrets.CLARITY_BASE_URL_3 }}
-  CLARITY_TOKEN_3: ${{ secrets.CLARITY_TOKEN_3 }}
-  CLARITY_BASE_URL_4: ${{ secrets.CLARITY_BASE_URL_4 }}
-  CLARITY_TOKEN_4: ${{ secrets.CLARITY_TOKEN_4 }}
-  CLARITY_BASE_URL_5: ${{ secrets.CLARITY_BASE_URL_5 }}
-  CLARITY_TOKEN_5: ${{ secrets.CLARITY_TOKEN_5 }}
-  GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
-  GOOGLE_PRIVATE_KEY: ${{ secrets.GOOGLE_PRIVATE_KEY }}
-  GOOGLE_DOC_ID: ${{ secrets.GOOGLE_DOC_ID }}
+  # --- Clarity (single endpoint, token as query param) ---
+  CLARITY_BASE_URL: ${{ secrets.CLARITY_BASE_URL }}
+  CLARITY_API_TOKEN: ${{ secrets.CLARITY_API_TOKEN }}
 
 jobs:
   fetch-and-report:
@@ -49,6 +40,15 @@ jobs:
 
       - name: Run Data Fetch & Report Generator
         run: python main.py
+
+      - name: Upload Daily Report (Text File)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daily-report
+          path: output/daily_report.txt
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload Airtable Data Artifact
         if: always()
