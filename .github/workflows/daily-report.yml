@@ -8,13 +8,12 @@ on:
 env:
   PYTHON_VERSION: '3.11'
   TZ: 'Asia/Karachi'
+  # --- Airtable credentials only (no Clarity) ---
   AIRTABLE_API_TOKEN: ${{ secrets.AIRTABLE_API_TOKEN }}
   AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
   AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
   AIRTABLE_TABLE_NAME: ${{ secrets.AIRTABLE_TABLE_NAME }}
   AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}
-  CLARITY_BASE_URL: ${{ secrets.CLARITY_BASE_URL }}
-  CLARITY_API_TOKEN: ${{ secrets.CLARITY_API_TOKEN }}
 
 jobs:
   fetch-and-report:
@@ -81,15 +80,6 @@ jobs:
         with:
           name: airtable-data
           path: output/airtable_data.json
-          retention-days: 14
-          if-no-files-found: warn
-
-      - name: Upload Clarity Data Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: clarity-data
-          path: output/clarity_data.json
           retention-days: 14
           if-no-files-found: warn
 
