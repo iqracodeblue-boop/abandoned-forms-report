@@ -1,4 +1,1 @@
-# Daily Abandoned Forms Report - Python dependencies
-# Only requests library needed now (Google API libraries removed since Sir wants TEXT report, not Google Docs)
-
 requests>=2.31.0
