@@ -10,11 +10,16 @@ Generates 4 SEPARATE brand text reports:
 
 Each report shows:
   - Airtable data for that brand
-  - Clarity data for that brand
-  - COMPARISON: Records in Clarity but NOT in Airtable (with session replay links!)
+  - Clarity data for that brand (fetched from brand's OWN Clarity URL)
+  - COMPARISON: Records in Clarity (Dashboard) but NOT in Airtable (with session links!)
 
-Clarity URL: https://clarity.signage.inc/api/v1/internal/abandoned-forms
-Token sent as ?api_token= query param (Laravel-style)
+Clarity URLs (one per brand):
+  - Quick Signage: https://clarity.quicksignage.com/api/v1/internal/abandoned-forms
+  - Signs.inc:     https://clarity.signs.inc/api/v1/internal/abandoned-forms
+  - Signage.inc:   https://clarity.signage.inc/api/v1/internal/abandoned-forms
+  - SignMakerz:    https://clarity.signmakerz.com/api/v1/internal/abandoned-forms
+
+Token (same for all): clarity_internal_abandoned_token_2026_sec789xyz
 
 Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
 """
@@ -39,16 +44,16 @@ AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY"
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME") or os.getenv("AIRTABLE_TABLE_ID")
 
-# Clarity API (URL provided by Sir)
-CLARITY_BASE_URL = os.getenv("CLARITY_BASE_URL") or "https://clarity.signage.inc/api/v1/internal/abandoned-forms"
+# Clarity token (same for all 4 brands)
 CLARITY_API_TOKEN = os.getenv("CLARITY_API_TOKEN") or "clarity_internal_abandoned_token_2026_sec789xyz"
 CLARITY_PER_PAGE = 25
 
+# 4 BRANDS - each with its own Clarity URL (per official Clarity API Integration Guide)
 BRANDS = [
-    {"name": "Quick Signage", "code": "quick_signage", "url_patterns": ["quicksignage"], "clarity_session_base": "https://clarity.quicksignage.com/admin/sessions/", "platform": "Quick Signage Live Website"},
-    {"name": "Signs.inc", "code": "signs_inc", "url_patterns": ["signs.inc", "signs-inc"], "clarity_session_base": "https://clarity.signs.inc/admin/sessions/", "platform": "Signs.inc Live Website"},
-    {"name": "Signage.inc", "code": "signage_inc", "url_patterns": ["signage.inc", "signage-inc"], "clarity_session_base": "https://clarity.signage.inc/admin/sessions/", "platform": "Signage.inc Live Website"},
-    {"name": "SignMakerz", "code": "sign_makerz", "url_patterns": ["signmakerz"], "clarity_session_base": "https://clarity.signmakerz.com/admin/sessions/", "platform": "SignMakerz Live Website"},
+    {"name": "Quick Signage", "code": "quick_signage", "url_patterns": ["quicksignage"], "clarity_base_url": "https://clarity.quicksignage.com/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.quicksignage.com/admin/sessions/", "platform": "Quick Signage Live Website"},
+    {"name": "Signs.inc", "code": "signs_inc", "url_patterns": ["signs.inc", "signs-inc"], "clarity_base_url": "https://clarity.signs.inc/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.signs.inc/admin/sessions/", "platform": "Signs.inc Live Website"},
+    {"name": "Signage.inc", "code": "signage_inc", "url_patterns": ["signage.inc", "signage-inc"], "clarity_base_url": "https://clarity.signage.inc/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.signage.inc/admin/sessions/", "platform": "Signage.inc Live Website"},
+    {"name": "SignMakerz", "code": "sign_makerz", "url_patterns": ["signmakerz"], "clarity_base_url": "https://clarity.signmakerz.com/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.signmakerz.com/admin/sessions/", "platform": "SignMakerz Live Website"},
 ]
 
 OUTPUT_DIR = "output"
@@ -133,7 +138,6 @@ def detect_brand_from_url(page_url):
 
 
 def build_clarity_session_url(record, brand):
-    """Build session replay URL from Clarity record."""
     for field in ("session_url", "sessionUrl", "replay_url", "replayUrl", "clarity_url", "url"):
         v = record.get(field) if isinstance(record, dict) else None
         if v and str(v).startswith("http"):
@@ -195,7 +199,6 @@ def fetch_airtable_data(start_time, end_time):
 
     print(f"Airtable TOTAL: {len(all_records)} records")
 
-    # Fallback: try 'Created' field if Last Modified returned 0
     if not all_records:
         print("  [FALLBACK] Trying filter with 'Created' field instead...")
         filter_formula_created = f"AND(IS_AFTER({{Created}}, '{start_str}'), IS_BEFORE({{Created}}, '{end_str}'))"
@@ -227,11 +230,10 @@ def fetch_airtable_data(start_time, end_time):
 
 
 # ============================================================================
-# PHASE 2: CLARITY DATA FETCH (single endpoint, token as query param)
+# PHASE 2: CLARITY DATA FETCH (per-brand URLs)
 # ============================================================================
 
 def _extract_records_from_response(data):
-    """Recursively extract records from any JSON response shape."""
     if isinstance(data, list):
         return [r for r in data if isinstance(r, dict)]
     if isinstance(data, dict):
@@ -249,23 +251,19 @@ def _extract_records_from_response(data):
     return []
 
 
-def fetch_clarity_data(start_time, end_time):
-    """Fetch from Clarity API. NO date params at API level (Laravel APIs often
-    don't support date filtering). Filter by date locally after fetching.
-    """
-    print("\n" + "=" * 60)
-    print("PHASE 2: Fetching data from Clarity API")
-    print("=" * 60)
-    print(f"Endpoint: {CLARITY_BASE_URL}")
-    print(f"Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}")
-    print(f"Per page: {CLARITY_PER_PAGE}")
-    print(f"Strategy: Fetch all records (no date filter at API level), filter by date locally")
+def fetch_brand_clarity_data(brand, start_time, end_time):
+    """Fetch Clarity records for a SINGLE brand from its OWN Clarity URL."""
+    brand_name = brand["name"]
+    brand_url = brand["clarity_base_url"]
 
-    all_clarity_records = []
+    print(f"\n  Brand: {brand_name}")
+    print(f"  URL: {brand_url}")
+    print(f"  Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}")
+
+    brand_records = []
     page = 1
 
     while True:
-        # Token as query param (Laravel-style), NO date params
         params = {
             "per_page": CLARITY_PER_PAGE,
             "api_token": CLARITY_API_TOKEN,
@@ -273,31 +271,36 @@ def fetch_clarity_data(start_time, end_time):
         }
 
         try:
-            print(f"\n  Page {page}: GET {CLARITY_BASE_URL}?per_page={CLARITY_PER_PAGE}&page={page}")
-            response = requests.get(CLARITY_BASE_URL, params=params, timeout=30)
-            print(f"    HTTP status: {response.status_code}")
+            print(f"    Page {page}: GET {brand_url}?per_page={CLARITY_PER_PAGE}&page={page}")
+            response = requests.get(brand_url, params=params, timeout=30)
+            print(f"      HTTP status: {response.status_code}")
 
             if response.status_code == 200:
                 try:
                     data = response.json()
                 except Exception as e:
-                    print(f"    JSON parse error: {e}")
-                    print(f"    Body preview: {response.text[:500]}")
+                    print(f"      JSON parse error: {e}")
+                    print(f"      Body preview: {response.text[:300]}")
                     break
 
-                # VERBOSE DEBUG
-                response_str = json.dumps(data, default=str)
-                print(f"    Response preview (first 400 chars): {response_str[:400]}")
-                if isinstance(data, dict):
-                    print(f"    Top-level keys: {list(data.keys())}")
-                elif isinstance(data, list):
-                    print(f"    Response is a list with {len(data)} items")
-                    if data and isinstance(data[0], dict):
-                        print(f"    First item keys: {list(data[0].keys())}")
+                # DEBUG: Show response structure on first page
+                if page == 1:
+                    response_str = json.dumps(data, default=str)
+                    print(f"      Response preview (first 300 chars): {response_str[:300]}")
+                    if isinstance(data, dict):
+                        print(f"      Top-level keys: {list(data.keys())}")
+                    elif isinstance(data, list) and data and isinstance(data[0], dict):
+                        print(f"      First item keys: {list(data[0].keys())}")
 
                 records = _extract_records_from_response(data)
-                print(f"    Extracted {len(records)} records (running total: {len(all_clarity_records) + len(records)})")
-                all_clarity_records.extend(records)
+                print(f"      Extracted {len(records)} records (running total: {len(brand_records) + len(records)})")
+
+                # Tag each record with brand name
+                for r in records:
+                    if isinstance(r, dict):
+                        r["_brand"] = brand_name
+
+                brand_records.extend(records)
 
                 # Pagination check
                 stop_pagination = False
@@ -305,24 +308,18 @@ def fetch_clarity_data(start_time, end_time):
                     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
                     last_page = meta.get("last_page")
                     current_page = meta.get("current_page", page)
-                    total = meta.get("total")
-                    print(f"    Pagination: current_page={current_page}, last_page={last_page}, total={total}")
                     if last_page is not None:
                         if current_page >= last_page:
-                            print(f"    Reached last page - stopping")
                             stop_pagination = True
                     else:
                         links = data.get("links", {}) if isinstance(data.get("links"), dict) else {}
                         next_url = links.get("next")
                         if not next_url:
-                            print(f"    No next page link - stopping")
                             stop_pagination = True
                     if len(records) < CLARITY_PER_PAGE:
-                        print(f"    Got {len(records)} < {CLARITY_PER_PAGE} - last page reached")
                         stop_pagination = True
                 elif isinstance(data, list):
                     if len(data) < CLARITY_PER_PAGE:
-                        print(f"    Got {len(data)} < {CLARITY_PER_PAGE} - last page reached")
                         stop_pagination = True
                 else:
                     stop_pagination = True
@@ -332,38 +329,50 @@ def fetch_clarity_data(start_time, end_time):
 
                 page += 1
                 if page > 100:
-                    print(f"    Safety limit (100 pages) reached - stopping")
+                    print(f"      Safety limit (100 pages) reached")
                     break
             elif response.status_code == 401:
-                print(f"    ERROR 401: Unauthorized - CLARITY_API_TOKEN is invalid or expired")
-                print(f"    Response body: {response.text[:500]}")
+                print(f"      ERROR 401: Unauthorized - token invalid")
                 break
             elif response.status_code == 403:
-                print(f"    ERROR 403: Forbidden - token doesn't have permission")
-                print(f"    Response body: {response.text[:500]}")
+                print(f"      ERROR 403: Forbidden")
                 break
             elif response.status_code == 404:
-                print(f"    ERROR 404: Not Found - check CLARITY_BASE_URL")
-                print(f"    Response body: {response.text[:500]}")
+                print(f"      ERROR 404: Not Found")
                 break
             elif response.status_code == 500:
-                print(f"    ERROR 500: Internal Server Error - API server issue")
-                print(f"    Response body: {response.text[:500]}")
+                print(f"      ERROR 500: Server error")
                 break
             else:
-                print(f"    ERROR {response.status_code}")
-                print(f"    Response body: {response.text[:500]}")
+                print(f"      ERROR {response.status_code}")
                 break
 
         except requests.exceptions.ConnectionError as e:
-            print(f"    Connection error: {e}")
+            print(f"      Connection error: {e}")
             break
         except requests.exceptions.Timeout as e:
-            print(f"    Timeout: API took too long to respond")
+            print(f"      Timeout")
             break
         except Exception as e:
-            print(f"    Unexpected error: {type(e).__name__}: {e}")
+            print(f"      Unexpected error: {type(e).__name__}: {e}")
             break
+
+    print(f"  {brand_name}: Got {len(brand_records)} records")
+    return brand_records
+
+
+def fetch_clarity_data(start_time, end_time):
+    """Fetch Clarity data from EACH brand's OWN URL (4 different URLs!)."""
+    print("\n" + "=" * 60)
+    print("PHASE 2: Fetching data from Clarity APIs (4 Brands - Per-Brand URLs)")
+    print("=" * 60)
+
+    all_clarity_records = []
+
+    # Fetch from EACH brand's own Clarity URL
+    for brand in BRANDS:
+        brand_records = fetch_brand_clarity_data(brand, start_time, end_time)
+        all_clarity_records.extend(brand_records)
 
     print(f"\nClarity TOTAL (before date filter): {len(all_clarity_records)} records")
 
@@ -407,7 +416,7 @@ def fetch_clarity_data(start_time, end_time):
 
     out_path = os.path.join(OUTPUT_DIR, "clarity_data.json")
     with open(out_path, "w") as f:
-        json.dump({"source": "clarity", "endpoint": CLARITY_BASE_URL, "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()}, "total_count": len(filtered_records), "raw_count_fetched": len(all_clarity_records), "records": filtered_records}, f, indent=2, default=str)
+        json.dump({"source": "clarity", "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()}, "total_count": len(filtered_records), "raw_count_fetched": len(all_clarity_records), "records": filtered_records}, f, indent=2, default=str)
     return filtered_records
 
 
@@ -427,16 +436,17 @@ def group_airtable_records_by_brand(airtable_records):
 
 
 def group_clarity_records_by_brand(clarity_records):
+    """Group Clarity records by brand using the _brand tag (set during fetch)."""
     brand_groups = {brand["name"]: [] for brand in BRANDS}
     brand_groups["Unknown"] = []
     for r in clarity_records:
         if not isinstance(r, dict):
             continue
-        url = r.get("url") or r.get("pageUrl") or r.get("page_url") or safe_get(r, "fields", "Page URL") or ""
-        brand_name = detect_brand_from_url(url)
-        if brand_name == "Unknown":
-            brand_name = "Signage.inc"
-        brand_groups[brand_name].append(r)
+        brand_name = r.get("_brand", "Unknown")
+        if brand_name in brand_groups:
+            brand_groups[brand_name].append(r)
+        else:
+            brand_groups["Unknown"].append(r)
     return brand_groups
 
 
@@ -468,7 +478,6 @@ def compare_brand_data(brand_name, brand_airtable_records, brand_clarity_records
 
     # Records in Clarity but NOT in Airtable (THE MISSING LEADS!)
     only_in_clarity = clarity_ids - airtable_ids
-    # Records in Airtable but NOT in Clarity
     only_in_airtable = airtable_ids - clarity_ids
 
     only_in_clarity_records = [clarity_map[rid] for rid in sorted(only_in_clarity)]
@@ -545,7 +554,7 @@ def generate_brand_text_report(brand, comparison, brand_airtable_records, brand_
     if airtable_count == 0 and clarity_count == 0:
         recommendation = "Both data sources are returning 0 records for this brand."
     elif airtable_count > 0 and clarity_count == 0:
-        recommendation = f"Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.\n\nRecommended Actions:\n  1. Verify CLARITY_BASE_URL secret is correct API URL\n     Current: {CLARITY_BASE_URL}\n  2. Verify CLARITY_API_TOKEN secret is valid auth token\n     Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}\n  3. Check the workflow run logs above - search for 'PHASE 2' section"
+        recommendation = f"Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.\n\nRecommended Actions:\n  1. Verify Clarity URL is correct for this brand:\n     {brand['clarity_base_url']}\n  2. Verify CLARITY_API_TOKEN secret is valid auth token\n     Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}\n  3. Check the workflow run logs above - search for 'PHASE 2' section"
     elif airtable_count == 0 and clarity_count > 0:
         recommendation = f"Clarity is connected ({clarity_count} records), but Airtable API is returning 0 records."
     elif comparison["difference"] > 0:
@@ -606,7 +615,7 @@ executed:
 {'-' * 100}
   Airtable:   {"CONNECTED" if airtable_count > 0 else "NOT RETURNING DATA"} ({airtable_count} records)
   Clarity:    {"CONNECTED" if clarity_count > 0 else "NOT RETURNING DATA"} ({clarity_count} records)
-  Endpoint:   {CLARITY_BASE_URL}
+  Endpoint:   {brand['clarity_base_url']}
 
 6. Airtable Breakdown (by Source)
 {'-' * 100}
@@ -636,7 +645,7 @@ Generated By:       GitHub Actions Automation
 
 def generate_all_brand_reports(airtable_records, clarity_records, start_time, end_time):
     print("\n" + "=" * 60)
-    print("PHASE 3: Generating 4 Brand Reports (TEXT FILES)")
+    print("PHASE 3: Generating Brand Reports (TEXT FILES)")
     print("=" * 60)
 
     airtable_by_brand = group_airtable_records_by_brand(airtable_records)
