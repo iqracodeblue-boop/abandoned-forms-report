@@ -1,54 +1,30 @@
 #!/usr/bin/env python3
 """
-Daily Abandoned Forms Report Generator (Multi-Brand + Clarity Comparison)
-============================================================================
-Generates 4 SEPARATE brand text reports:
-  - Quick Signage
-  - Signs.inc
-  - Signage.inc
-  - SignMakerz
+Daily Abandoned Forms Report Generator
+======================================
+Fetches Clarity data (from 4 brand-specific URLs) + Airtable data,
+generates 4 separate brand text reports showing:
+  - Section 3: Leads in Clarity but NOT in Airtable (with session replay links)
+  - Section 4: All abandoned forms in Airtable (with Page URLs)
 
-Each report shows:
-  - Airtable data for that brand
-  - Clarity data for that brand (fetched from brand's OWN Clarity URL)
-  - COMPARISON: Records in Clarity (Dashboard) but NOT in Airtable (with session links!)
+Clarity API response structure:
+  {"sessions": {"data": [...records...], "last_page": N, "total": N, ...}}
 
-Clarity URLs (one per brand):
-  - Quick Signage: https://clarity.quicksignage.com/api/v1/internal/abandoned-forms
-  - Signs.inc:     https://clarity.signs.inc/api/v1/internal/abandoned-forms
-  - Signage.inc:   https://clarity.signage.inc/api/v1/internal/abandoned-forms
-  - SignMakerz:    https://clarity.signmakerz.com/api/v1/internal/abandoned-forms
-
-Token (same for all): clarity_internal_abandoned_token_2026_sec789xyz
-
-Daily auto-update: cron '0 4 * * *' (4 AM UTC = 9 AM Karachi)
+Record fields: uuid, started_at, entry_url, ip_address, in_airtable, is_spam
 """
 
-import os
-import sys
-import json
-import requests
+import os, sys, json, requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-
 
 KARACHI_TZ = ZoneInfo("Asia/Karachi")
 UTC_TZ = ZoneInfo("UTC")
 
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_API_TOKEN") or os.getenv("AIRTABLE_API_KEY")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
 AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME") or os.getenv("AIRTABLE_TABLE_ID")
-
-# Clarity token (same for all 4 brands)
 CLARITY_API_TOKEN = os.getenv("CLARITY_API_TOKEN") or "clarity_internal_abandoned_token_2026_sec789xyz"
-CLARITY_PER_PAGE = 25
 
-# 4 BRANDS - each with its own Clarity URL (per official Clarity API Integration Guide)
 BRANDS = [
     {"name": "Quick Signage", "code": "quick_signage", "url_patterns": ["quicksignage"], "clarity_base_url": "https://clarity.quicksignage.com/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.quicksignage.com/admin/sessions/", "platform": "Quick Signage Live Website"},
     {"name": "Signs.inc", "code": "signs_inc", "url_patterns": ["signs.inc", "signs-inc"], "clarity_base_url": "https://clarity.signs.inc/api/v1/internal/abandoned-forms", "clarity_session_base": "https://clarity.signs.inc/admin/sessions/", "platform": "Signs.inc Live Website"},
@@ -60,676 +36,331 @@ OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
-
 def get_time_window():
-    now_karachi = datetime.now(KARACHI_TZ)
-    end_karachi = now_karachi.replace(hour=9, minute=0, second=0, microsecond=0)
-    if now_karachi < end_karachi:
-        end_karachi = end_karachi - timedelta(days=1)
-    start_karachi = end_karachi - timedelta(days=1)
-    return start_karachi, end_karachi
+    now = datetime.now(KARACHI_TZ)
+    end = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    if now < end: end = end - timedelta(days=1)
+    return end - timedelta(days=1), end
 
+def safe_get(r, *ks, d=""):
+    for k in ks:
+        if isinstance(r, dict) and k in r: r = r[k]
+        else: return d
+    return r if r is not None else d
 
-def safe_get(record, *keys, default=""):
-    cur = record
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return default
-    return cur if cur is not None else default
+def get_airtable_rid(r):
+    if not isinstance(r, dict): return None
+    rid = r.get("id")
+    if rid and str(rid).startswith("rec"): return str(rid)
+    f = r.get("fields", {})
+    return str(f.get("Airtable Record ID")) if isinstance(f, dict) and f.get("Airtable Record ID") else rid
 
-
-def get_airtable_record_id(record):
-    if not isinstance(record, dict):
-        return None
-    rid = record.get("id")
-    if rid and str(rid).startswith("rec"):
-        return str(rid)
-    fields = record.get("fields", {})
-    rid2 = fields.get("Airtable Record ID") if isinstance(fields, dict) else None
-    if rid2:
-        return str(rid2)
-    return rid
-
-
-def get_clarity_record_id(record):
-    if not isinstance(record, dict):
-        return None
-    for k in ("id", "ID", "form_id", "formId", "session_id", "sessionId", "record_id", "recordId", "Form ID"):
-        v = record.get(k)
-        if v:
-            return str(v)
-    fields = record.get("fields", {}) if isinstance(record.get("fields"), dict) else {}
-    for k in ("id", "ID", "form_id", "formId", "session_id", "sessionId", "record_id", "recordId", "Form ID", "Airtable Record ID"):
-        v = fields.get(k)
-        if v:
-            return str(v)
+def get_clarity_rid(r):
+    """Get Clarity record ID — use uuid (session replay ID)."""
+    if not isinstance(r, dict): return None
+    for k in ("uuid", "id", "session_id", "sessionId"):
+        v = r.get(k)
+        if v: return str(v)
     return None
 
+def trunc(t, n=50):
+    if not t or t == "?": return "?"
+    t = str(t)
+    return t if len(t) <= n else t[:n-3] + "..."
 
-def truncate(text, max_len=70):
-    if not text or text == "?":
-        return "?"
-    text = str(text)
-    if len(text) <= max_len:
-        return text
-    return text[:max_len - 3] + "..."
+def fmt_date(s, e):
+    return f"{s.strftime('%B %d, %Y (%I:%M %p)')} to {e.strftime('%B %d, %Y (%I:%M %p)')}"
 
-
-def format_date_range_human(start_time, end_time):
-    s = start_time.strftime("%B %d, %Y (%I:%M %p)")
-    e = end_time.strftime("%B %d, %Y (%I:%M %p)")
-    return f"{s} to {e}"
-
-
-def detect_brand_from_url(page_url):
-    if not page_url:
-        return "Unknown"
-    url = str(page_url).lower()
-    for brand in BRANDS:
-        for pattern in brand["url_patterns"]:
-            if pattern.lower() in url:
-                return brand["name"]
+def detect_brand(url):
+    if not url: return "Unknown"
+    u = str(url).lower()
+    for b in BRANDS:
+        for p in b["url_patterns"]:
+            if p.lower() in u: return b["name"]
     return "Unknown"
 
-
-def build_clarity_session_url(record, brand):
-    for field in ("session_url", "sessionUrl", "replay_url", "replayUrl", "clarity_url", "url"):
-        v = record.get(field) if isinstance(record, dict) else None
-        if v and str(v).startswith("http"):
-            return str(v)
-    for field in ("session_id", "sessionId", "session", "id"):
-        v = record.get(field) if isinstance(record, dict) else None
-        if v:
-            return f"{brand['clarity_session_base']}{v}"
+def build_session_url(r, brand):
+    """Build session replay URL using uuid field."""
+    uuid = r.get("uuid") if isinstance(r, dict) else None
+    if uuid: return f"{brand['clarity_session_base']}{uuid}"
+    for f in ("session_url", "url"):
+        v = r.get(f) if isinstance(r, dict) else None
+        if v and str(v).startswith("http"): return str(v)
     return "—"
 
 
-# ============================================================================
-# PHASE 1: AIRTABLE DATA FETCH
-# ============================================================================
+# === PHASE 1: AIRTABLE ===
 
-def fetch_airtable_data(start_time, end_time):
-    print("\n" + "=" * 60)
-    print("PHASE 1: Fetching data from Airtable")
-    print("=" * 60)
-    print(f"Time window (Karachi): {start_time} -> {end_time}")
-
+def fetch_airtable(start, end):
+    print("\n" + "="*60 + "\nPHASE 1: Airtable\n" + "="*60)
     if not all([AIRTABLE_TOKEN, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME]):
-        print("Missing Airtable credentials - skipping Phase 1")
-        return []
-
-    start_utc = start_time.astimezone(UTC_TZ)
-    end_utc = end_time.astimezone(UTC_TZ)
-    start_str = start_utc.strftime("%Y-%m-%dT%H:%M:%S")
-    end_str = end_utc.strftime("%Y-%m-%dT%H:%M:%S")
-    print(f"Airtable filter (UTC): {start_str} -> {end_str}")
-
+        print("Missing Airtable credentials"); return []
+    s_utc, e_utc = start.astimezone(UTC_TZ), end.astimezone(UTC_TZ)
+    s_str, e_str = s_utc.strftime("%Y-%m-%dT%H:%M:%S"), e_utc.strftime("%Y-%m-%dT%H:%M:%S")
     url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
-
-    filter_formula = f"AND(IS_AFTER({{Last Modified}}, '{start_str}'), IS_BEFORE({{Last Modified}}, '{end_str}'))"
-
-    all_records = []
-    offset = None
-    page = 1
-
+    hdr = {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
+    ff = f"AND(IS_AFTER({{Last Modified}}, '{s_str}'), IS_BEFORE({{Last Modified}}, '{e_str}'))"
+    recs, off, pg = [], None, 1
     while True:
-        params = {"filterByFormula": filter_formula, "pageSize": 100}
-        if offset:
-            params["offset"] = offset
+        p = {"filterByFormula": ff, "pageSize": 100}
+        if off: p["offset"] = off
         try:
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            response.raise_for_status()
-            data = response.json()
-            records = data.get("records", [])
-            all_records.extend(records)
-            print(f"  Page {page}: fetched {len(records)} records (total: {len(all_records)})")
-            page += 1
-            offset = data.get("offset")
-            if not offset:
-                break
-        except requests.exceptions.RequestException as e:
-            print(f"Airtable API error: {e}")
-            break
-
-    print(f"Airtable TOTAL: {len(all_records)} records")
-
-    if not all_records:
-        print("  [FALLBACK] Trying filter with 'Created' field instead...")
-        filter_formula_created = f"AND(IS_AFTER({{Created}}, '{start_str}'), IS_BEFORE({{Created}}, '{end_str}'))"
-        offset = None
-        page = 1
-        while True:
-            params = {"filterByFormula": filter_formula_created, "pageSize": 100}
-            if offset:
-                params["offset"] = offset
-            try:
-                response = requests.get(url, headers=headers, params=params, timeout=30)
-                response.raise_for_status()
-                data = response.json()
-                records = data.get("records", [])
-                all_records.extend(records)
-                print(f"  [Created] Page {page}: fetched {len(records)} (total: {len(all_records)})")
-                page += 1
-                offset = data.get("offset")
-                if not offset:
-                    break
-            except requests.exceptions.RequestException as e:
-                print(f"  [Created] error: {e}")
-                break
-
-    out_path = os.path.join(OUTPUT_DIR, "airtable_data.json")
-    with open(out_path, "w") as f:
-        json.dump({"source": "airtable", "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()}, "filter_utc": {"start": start_str, "end": end_str}, "total_count": len(all_records), "records": all_records}, f, indent=2, default=str)
-    return all_records
-
-
-# ============================================================================
-# PHASE 2: CLARITY DATA FETCH (per-brand URLs)
-# ============================================================================
-
-def _extract_records_from_response(data):
-    if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
-    if isinstance(data, dict):
-        for key in ("data", "records", "items", "results", "value", "rows", "entries", "list", "items_list", "forms"):
-            v = data.get(key)
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-        for v in data.values():
-            if isinstance(v, list) and v and isinstance(v[0], dict):
-                return v
-            if isinstance(v, dict):
-                nested = _extract_records_from_response(v)
-                if nested:
-                    return nested
-    return []
-
-
-def fetch_brand_clarity_data(brand, start_time, end_time):
-    """Fetch Clarity records for a SINGLE brand from its OWN Clarity URL."""
-    brand_name = brand["name"]
-    brand_url = brand["clarity_base_url"]
-
-    print(f"\n  Brand: {brand_name}")
-    print(f"  URL: {brand_url}")
-    print(f"  Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}")
-
-    brand_records = []
-    page = 1
-
-    while True:
-        params = {
-            "per_page": CLARITY_PER_PAGE,
-            "api_token": CLARITY_API_TOKEN,
-            "page": page,
-        }
-
-        try:
-            print(f"    Page {page}: GET {brand_url}?per_page={CLARITY_PER_PAGE}&page={page}")
-            response = requests.get(brand_url, params=params, timeout=30)
-            print(f"      HTTP status: {response.status_code}")
-
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                except Exception as e:
-                    print(f"      JSON parse error: {e}")
-                    print(f"      Body preview: {response.text[:300]}")
-                    break
-
-                # DEBUG: Show response structure on first page
-                if page == 1:
-                    response_str = json.dumps(data, default=str)
-                    print(f"      Response preview (first 300 chars): {response_str[:300]}")
-                    if isinstance(data, dict):
-                        print(f"      Top-level keys: {list(data.keys())}")
-                    elif isinstance(data, list) and data and isinstance(data[0], dict):
-                        print(f"      First item keys: {list(data[0].keys())}")
-
-                records = _extract_records_from_response(data)
-                print(f"      Extracted {len(records)} records (running total: {len(brand_records) + len(records)})")
-
-                # Tag each record with brand name
-                for r in records:
-                    if isinstance(r, dict):
-                        r["_brand"] = brand_name
-
-                brand_records.extend(records)
-
-                # Pagination check
-                stop_pagination = False
-                if isinstance(data, dict):
-                    meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
-                    last_page = meta.get("last_page")
-                    current_page = meta.get("current_page", page)
-                    if last_page is not None:
-                        if current_page >= last_page:
-                            stop_pagination = True
-                    else:
-                        links = data.get("links", {}) if isinstance(data.get("links"), dict) else {}
-                        next_url = links.get("next")
-                        if not next_url:
-                            stop_pagination = True
-                    if len(records) < CLARITY_PER_PAGE:
-                        stop_pagination = True
-                elif isinstance(data, list):
-                    if len(data) < CLARITY_PER_PAGE:
-                        stop_pagination = True
-                else:
-                    stop_pagination = True
-
-                if stop_pagination:
-                    break
-
-                page += 1
-                if page > 100:
-                    print(f"      Safety limit (100 pages) reached")
-                    break
-            elif response.status_code == 401:
-                print(f"      ERROR 401: Unauthorized - token invalid")
-                break
-            elif response.status_code == 403:
-                print(f"      ERROR 403: Forbidden")
-                break
-            elif response.status_code == 404:
-                print(f"      ERROR 404: Not Found")
-                break
-            elif response.status_code == 500:
-                print(f"      ERROR 500: Server error")
-                break
-            else:
-                print(f"      ERROR {response.status_code}")
-                break
-
-        except requests.exceptions.ConnectionError as e:
-            print(f"      Connection error: {e}")
-            break
-        except requests.exceptions.Timeout as e:
-            print(f"      Timeout")
-            break
+            r = requests.get(url, headers=hdr, params=p, timeout=30)
+            r.raise_for_status()
+            d = r.json()
+            rs = d.get("records", [])
+            recs.extend(rs)
+            print(f"  Page {pg}: {len(rs)} records (total: {len(recs)})")
+            pg += 1; off = d.get("offset")
+            if not off: break
         except Exception as e:
-            print(f"      Unexpected error: {type(e).__name__}: {e}")
-            break
+            print(f"Airtable error: {e}"); break
+    print(f"Airtable TOTAL: {len(recs)}")
+    with open(os.path.join(OUTPUT_DIR, "airtable_data.json"), "w") as f:
+        json.dump({"total": len(recs), "records": recs}, f, indent=2, default=str)
+    return recs
 
-    print(f"  {brand_name}: Got {len(brand_records)} records")
-    return brand_records
 
+# === PHASE 2: CLARITY (per-brand, using exact API field names) ===
 
-def fetch_clarity_data(start_time, end_time):
-    """Fetch Clarity data from EACH brand's OWN URL (4 different URLs!)."""
-    print("\n" + "=" * 60)
-    print("PHASE 2: Fetching data from Clarity APIs (4 Brands - Per-Brand URLs)")
-    print("=" * 60)
-
-    all_clarity_records = []
-
-    # Fetch from EACH brand's own Clarity URL
-    for brand in BRANDS:
-        brand_records = fetch_brand_clarity_data(brand, start_time, end_time)
-        all_clarity_records.extend(brand_records)
-
-    print(f"\nClarity TOTAL (before date filter): {len(all_clarity_records)} records")
-
-    # Filter by date locally
-    filtered_records = []
-    for r in all_clarity_records:
-        if not isinstance(r, dict):
-            continue
-        ts = (r.get("timestamp") or r.get("createdAt") or r.get("created_at")
-              or r.get("last_modified") or r.get("lastModified")
-              or r.get("Last Modified") or r.get("Created")
-              or r.get("date") or r.get("datetime") or r.get("submitted_at")
-              or r.get("updated_at"))
-        if not ts:
-            filtered_records.append(r)
-            continue
+def fetch_brand_clarity(brand, start, end):
+    """Fetch from one brand's Clarity URL. Response: {"sessions": {"data": [...], "last_page": N}}"""
+    bn, bu = brand["name"], brand["clarity_base_url"]
+    print(f"\n  Brand: {bn}")
+    print(f"  URL: {bu}")
+    print(f"  Token: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}")
+    brand_recs = []
+    page = 1
+    while True:
+        params = {"per_page": 25, "api_token": CLARITY_API_TOKEN, "page": page}
         try:
-            ts_str = str(ts).replace("Z", "+00:00")
-            if "+" not in ts_str and "T" in ts_str:
-                ts_str = ts_str + "+00:00"
-            if "T" in ts_str:
-                record_time = datetime.fromisoformat(ts_str)
-            else:
-                record_time = datetime.strptime(str(ts)[:10], "%Y-%m-%d")
-                record_time = record_time.replace(tzinfo=UTC_TZ)
-            if record_time.tzinfo is None:
-                record_time = record_time.replace(tzinfo=UTC_TZ)
-            record_time_utc = record_time.astimezone(UTC_TZ)
-            start_utc = start_time.astimezone(UTC_TZ)
-            end_utc = end_time.astimezone(UTC_TZ)
-            if start_utc <= record_time_utc <= end_utc:
-                filtered_records.append(r)
-        except Exception:
-            filtered_records.append(r)
+            print(f"    Page {page}: GET {bu}?per_page=25&page={page}")
+            resp = requests.get(bu, params=params, timeout=30)
+            print(f"      HTTP: {resp.status_code}")
+            if resp.status_code != 200:
+                print(f"      Body: {resp.text[:300]}"); break
+            data = resp.json()
+            # EXACT structure: {"sessions": {"data": [...], "last_page": N, "current_page": N, "total": N}}
+            sessions = data.get("sessions", {})
+            records = sessions.get("data", [])
+            last_page = sessions.get("last_page", 1)
+            total = sessions.get("total", 0)
+            if page == 1:
+                print(f"      Top-level keys: {list(data.keys())}")
+                print(f"      Pagination: last_page={last_page}, total={total}")
+                if records:
+                    print(f"      First record keys: {list(records[0].keys())}")
+                    print(f"      Sample: uuid={records[0].get('uuid')}, entry_url={trunc(str(records[0].get('entry_url','')),60)}, in_airtable={records[0].get('in_airtable')}")
+            print(f"      Got {len(records)} records (running: {len(brand_recs)+len(records)})")
+            for r in records:
+                if isinstance(r, dict): r["_brand"] = bn
+            brand_recs.extend(records)
+            if page >= last_page:
+                print(f"      Reached last page ({page}/{last_page})"); break
+            if len(records) < 25:
+                print(f"      Last page reached"); break
+            page += 1
+            if page > 100: print("      Safety limit"); break
+        except Exception as e:
+            print(f"      Error: {type(e).__name__}: {e}"); break
+    print(f"  {bn}: {len(brand_recs)} records total")
+    return brand_recs
 
-    print(f"Clarity TOTAL (after date filter): {len(filtered_records)} records")
-    if all_clarity_records and not filtered_records:
-        print(f"  Note: {len(all_clarity_records)} records fetched but 0 matched date window.")
-        print(f"  Using all {len(all_clarity_records)} records for comparison.")
-        filtered_records = all_clarity_records
-
-    out_path = os.path.join(OUTPUT_DIR, "clarity_data.json")
-    with open(out_path, "w") as f:
-        json.dump({"source": "clarity", "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()}, "total_count": len(filtered_records), "raw_count_fetched": len(all_clarity_records), "records": filtered_records}, f, indent=2, default=str)
-    return filtered_records
-
-
-# ============================================================================
-# GROUPING BY BRAND
-# ============================================================================
-
-def group_airtable_records_by_brand(airtable_records):
-    brand_groups = {brand["name"]: [] for brand in BRANDS}
-    brand_groups["Unknown"] = []
-    for r in airtable_records:
-        fields = safe_get(r, "fields", default={}) or {}
-        page_url = fields.get("Page URL", "")
-        brand_name = detect_brand_from_url(page_url)
-        brand_groups[brand_name].append(r)
-    return brand_groups
-
-
-def group_clarity_records_by_brand(clarity_records):
-    """Group Clarity records by brand using the _brand tag (set during fetch)."""
-    brand_groups = {brand["name"]: [] for brand in BRANDS}
-    brand_groups["Unknown"] = []
-    for r in clarity_records:
-        if not isinstance(r, dict):
-            continue
-        brand_name = r.get("_brand", "Unknown")
-        if brand_name in brand_groups:
-            brand_groups[brand_name].append(r)
-        else:
-            brand_groups["Unknown"].append(r)
-    return brand_groups
-
-
-# ============================================================================
-# COMPARISON LOGIC (per brand)
-# ============================================================================
-
-def compare_brand_data(brand_name, brand_airtable_records, brand_clarity_records, start_time, end_time):
-    """Compare Airtable vs Clarity records for a specific brand.
-    Find records in Clarity but NOT in Airtable (the missing leads!).
-    """
-    airtable_count = len(brand_airtable_records)
-    clarity_count = len(brand_clarity_records)
-    difference = clarity_count - airtable_count
-
-    airtable_map = {}
-    for r in brand_airtable_records:
-        rid = get_airtable_record_id(r)
-        if rid:
-            airtable_map[rid] = r
-    clarity_map = {}
-    for r in brand_clarity_records:
-        rid = get_clarity_record_id(r)
-        if rid:
-            clarity_map[rid] = r
-
-    airtable_ids = set(airtable_map.keys())
-    clarity_ids = set(clarity_map.keys())
-
-    # Records in Clarity but NOT in Airtable (THE MISSING LEADS!)
-    only_in_clarity = clarity_ids - airtable_ids
-    only_in_airtable = airtable_ids - clarity_ids
-
-    only_in_clarity_records = [clarity_map[rid] for rid in sorted(only_in_clarity)]
-    only_in_airtable_records = [airtable_map[rid] for rid in sorted(only_in_airtable)]
-
-    return {
-        "brand_name": brand_name,
-        "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
-        "airtable_count": airtable_count,
-        "clarity_count": clarity_count,
-        "difference": difference,
-        "airtable_unique_ids": len(airtable_ids),
-        "clarity_unique_ids": len(clarity_ids),
-        "only_in_clarity_records": only_in_clarity_records,
-        "only_in_airtable_records": only_in_airtable_records,
-    }
+def fetch_clarity(start, end):
+    print("\n" + "="*60 + "\nPHASE 2: Clarity APIs (4 brands)\n" + "="*60)
+    all_recs = []
+    for b in BRANDS:
+        all_recs.extend(fetch_brand_clarity(b, start, end))
+    print(f"\nClarity TOTAL: {len(all_recs)} records")
+    # Filter by date locally (using started_at field)
+    filtered = []
+    s_utc, e_utc = start.astimezone(UTC_TZ), end.astimezone(UTC_TZ)
+    for r in all_recs:
+        if not isinstance(r, dict): continue
+        ts = r.get("started_at") or r.get("created_at")
+        if not ts: filtered.append(r); continue
+        try:
+            t = datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+            if t.tzinfo is None: t = t.replace(tzinfo=UTC_TZ)
+            if s_utc <= t.astimezone(UTC_TZ) <= e_utc: filtered.append(r)
+        except: filtered.append(r)
+    print(f"Clarity after date filter: {len(filtered)}")
+    if all_recs and not filtered:
+        print(f"  Using all {len(all_recs)} (no date match)")
+        filtered = all_recs
+    with open(os.path.join(OUTPUT_DIR, "clarity_data.json"), "w") as f:
+        json.dump({"total": len(filtered), "raw": len(all_recs), "records": filtered}, f, indent=2, default=str)
+    return filtered
 
 
-# ============================================================================
-# PER-BRAND TEXT REPORT GENERATION
-# ============================================================================
+# === GROUPING ===
 
-def generate_brand_text_report(brand, comparison, brand_airtable_records, brand_clarity_records, start_time, end_time):
-    brand_name = brand["name"]
-    airtable_count = comparison["airtable_count"]
-    clarity_count = comparison["clarity_count"]
-    only_in_clarity_records = comparison.get("only_in_clarity_records", [])
+def group_airtable(recs):
+    g = {b["name"]: [] for b in BRANDS}; g["Unknown"] = []
+    for r in recs:
+        f = safe_get(r, "fields", d={}) or {}
+        g[detect_brand(f.get("Page URL",""))].append(r)
+    return g
 
+def group_clarity(recs):
+    g = {b["name"]: [] for b in BRANDS}; g["Unknown"] = []
+    for r in recs:
+        if not isinstance(r, dict): continue
+        bn = r.get("_brand", "Unknown")
+        g[bn].append(r) if bn in g else g["Unknown"].append(r)
+    return g
+
+
+# === REPORT GENERATION ===
+
+def gen_report(brand, at_recs, cl_recs, start, end):
+    bn = brand["name"]
+    at_count = len(at_recs)
+    # Count Clarity records NOT in Airtable (using API's in_airtable field!)
+    not_in_airtable = [r for r in cl_recs if isinstance(r, dict) and not r.get("in_airtable", True)]
+    cl_count = len(cl_recs)
     now = datetime.now(KARACHI_TZ)
-    date_str = now.strftime("%d %b %Y, %H:%M (PKT)")
-    date_range_human = format_date_range_human(start_time, end_time)
-
-    spam_count = 0
-    for r in brand_airtable_records:
-        fields = safe_get(r, "fields", default={}) or {}
-        v = fields.get("isSpam")
-        if v and str(v).lower() == "true":
-            spam_count += 1
-    non_spam_count = airtable_count - spam_count
-
-    source_counts = {}
-    for r in brand_airtable_records:
-        fields = safe_get(r, "fields", default={}) or {}
-        src = fields.get("Record Source") or "Unknown"
-        source_counts[src] = source_counts.get(src, 0) + 1
-    source_breakdown = "\n".join(
-        f"    {src}: {cnt}"
-        for src, cnt in sorted(source_counts.items(), key=lambda x: -x[1])
-    ) if source_counts else "    (no source info available)"
-
-    # BUILD THE MAIN TABLE: Leads in Clarity (Dashboard) but NOT in Airtable!
-    if clarity_count > 0 and only_in_clarity_records:
-        leads_table = "+----------------------+--------------------------+----------------------------------------------------+\n"
-        leads_table += "| DATE & TIMESTAMP     | VISITOR EMAIL / ID       | SESSION REPLAY / VIEW LINK                         |\n"
-        leads_table += "+----------------------+--------------------------+----------------------------------------------------+\n"
-        for r in only_in_clarity_records[:30]:
-            rid = get_clarity_record_id(r) or "—"
-            ts = (r.get("timestamp") or r.get("createdAt") or r.get("created_at") or "—")
-            ts_short = truncate(str(ts), 20)
-            email = (r.get("email") or r.get("visitor_email") or r.get("user_email")
-                     or safe_get(r, "fields", "Email") or "—")
-            email_short = truncate(str(email), 24)
-            session_url = build_clarity_session_url(r, brand)
-            session_url_short = truncate(session_url, 50)
-            leads_table += f"| {ts_short:<20} | {email_short:<24} | {session_url_short:<50} |\n"
-        leads_table += "+----------------------+--------------------------+----------------------------------------------------+\n"
-        if len(only_in_clarity_records) > 30:
-            leads_table += f"\n    ... and {len(only_in_clarity_records) - 30} more records (see artifact JSON for full list)\n"
-    elif clarity_count > 0 and not only_in_clarity_records:
-        leads_table = "    All Clarity records are also present in Airtable. No missing leads.\n"
+    ds = now.strftime("%d %b %Y, %H:%M (PKT)")
+    drh = fmt_date(start, end)
+    spam = sum(1 for r in at_recs if str(safe_get(r,"fields",d={}).get("isSpam","")).lower()=="true")
+    # Source breakdown
+    sc = {}
+    for r in at_recs:
+        s = safe_get(r,"fields",d={}).get("Record Source") or "Unknown"
+        sc[s] = sc.get(s,0)+1
+    sb = "\n".join(f"    {s}: {c}" for s,c in sorted(sc.items(),key=lambda x:-x[1])) if sc else "    (none)"
+    # Section 3: Leads NOT in Airtable (from Clarity, using in_airtable field!)
+    if not_in_airtable:
+        lt = "+----------------------+--------------------------+----------------------------------------------------+\n"
+        lt += "| DATE & TIMESTAMP     | VISITOR / IP             | SESSION REPLAY / VIEW LINK                         |\n"
+        lt += "+----------------------+--------------------------+----------------------------------------------------+\n"
+        for r in not_in_airtable[:30]:
+            ts = trunc(str(r.get("started_at","—")),20)
+            ip = trunc(str(r.get("ip_address","—")),24)
+            url = trunc(build_session_url(r, brand), 50)
+            lt += f"| {ts:<20} | {ip:<24} | {url:<50} |\n"
+        lt += "+----------------------+--------------------------+----------------------------------------------------+\n"
+        if len(not_in_airtable)>30: lt += f"\n    ... and {len(not_in_airtable)-30} more\n"
+    elif cl_count > 0:
+        lt = "    All Clarity records are in Airtable. No missing leads.\n"
     else:
-        leads_table = "    (Clarity API not returning data for this brand.\n     Once Clarity API is connected, this section will display a table\n     of records captured by Clarity but missing from Airtable,\n     along with session replay links.)\n"
-
-    if airtable_count == 0 and clarity_count == 0:
-        recommendation = "Both data sources are returning 0 records for this brand."
-    elif airtable_count > 0 and clarity_count == 0:
-        recommendation = f"Airtable is connected ({airtable_count} records), but Clarity API is returning 0 records.\n\nRecommended Actions:\n  1. Verify Clarity URL is correct for this brand:\n     {brand['clarity_base_url']}\n  2. Verify CLARITY_API_TOKEN secret is valid auth token\n     Token preview: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}\n  3. Check the workflow run logs above - search for 'PHASE 2' section"
-    elif airtable_count == 0 and clarity_count > 0:
-        recommendation = f"Clarity is connected ({clarity_count} records), but Airtable API is returning 0 records."
-    elif comparison["difference"] > 0:
-        recommendation = f"Clarity has {comparison['difference']} MORE forms than Airtable for this brand.\n\nLikely cause: Some form submissions were captured by Clarity but failed to sync to Airtable.\n\nRecommended Action: Review the unmatched Clarity records in Section 3 above (with session replay links),\nthen check Airtable's webhook and integration health."
-    elif comparison["difference"] < 0:
-        recommendation = f"Airtable has {abs(comparison['difference'])} MORE forms than Clarity for this brand.\n\nLikely cause: Stale records in Airtable, or Clarity's date filter is excluding valid sessions."
+        lt = "    (Clarity API not returning data for this brand.)\n"
+    # Section 4: Abandoned forms in Airtable (with Page URLs)
+    if at_recs:
+        ft = "+----------------------+--------------------------+----------------------------------------------------+----------+\n"
+        ft += "| DATE & TIMESTAMP     | RECORD ID                | PAGE URL                                           | SPAM     |\n"
+        ft += "+----------------------+--------------------------+----------------------------------------------------+----------+\n"
+        for r in at_recs[:50]:
+            rid = get_airtable_rid(r) or "—"
+            f = safe_get(r,"fields",d={}) or {}
+            ct = trunc(str(f.get("Created") or f.get("Created At") or "—"),20)
+            pu = trunc(str(f.get("Page URL") or "—"),50)
+            sp = trunc(str(f.get("isSpam") or "—"),8)
+            ft += f"| {ct:<20} | {str(rid)[:24]:<24} | {pu:<50} | {sp:<8} |\n"
+        ft += "+----------------------+--------------------------+----------------------------------------------------+----------+\n"
+        if len(at_recs)>50: ft += f"\n    ... and {len(at_recs)-50} more\n"
     else:
-        recommendation = "Both sources match perfectly in record count for this brand."
+        ft = "    (No abandoned forms found in Airtable.)\n"
+    # Recommendation
+    if at_count==0 and cl_count==0: rec="Both sources returning 0 records."
+    elif at_count>0 and cl_count==0: rec=f"Airtable connected ({at_count}), Clarity returning 0.\n  URL: {brand['clarity_base_url']}\n  Token: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}"
+    elif at_count==0 and cl_count>0: rec=f"Clarity connected ({cl_count}), Airtable returning 0."
+    elif len(not_in_airtable)>0: rec=f"{len(not_in_airtable)} leads in Clarity but NOT in Airtable.\n  Action: Check Section 3 for session replay links."
+    else: rec="Both sources match."
+    body = f"""{bn} Abandoned Forms & Leads Verification Report
+{'='*100}
 
-    report_body = f"""{brand_name} Abandoned Forms & Leads Verification Report
-{'=' * 100}
-
-Report Title:    {brand_name} Abandoned Forms & Dashboard Verification Report
-Date Range:      {date_range_human}
+Report Title:    {bn} Abandoned Forms & Dashboard Verification Report
+Date Range:      {drh}
 Prepared By:     Iqra Kashif
 Audited Platform: {brand['platform']}, Airtable, and Internal Dashboard
 
 1. Executive Summary
-{'-' * 100}
+{'-'*100}
 This professional audit report reviews the data integrity and synchronization status
-between the live {brand_name} website frontend, abandoned forms capture system,
-Airtable database, and the internal admin dashboard. The evaluation period covers
-{date_range_human}.
-
-The primary objective of this audit was to verify whether user interactions, form
-inputs, and abandoned form session data are accurately flowing into Airtable and
-reflecting correctly on the internal dashboard.
+between the live {bn} website frontend, abandoned forms capture system, Airtable database,
+and the internal admin dashboard. The evaluation period covers {drh}.
 
 2. Audit Scope & Verification Methodology
-{'-' * 100}
-During the specified 24-hour window, the following pipeline verification steps were
-executed:
-
-  - Frontend Event Tracking: Monitored user form interactions, field inputs, and
-    exit intents on key pages.
-  - Session Identification & Copy Tracking: Gathered active session IDs and
-    timestamped tracking payloads to verify unsubmitted or partial form states.
-  - Airtable Synchronization Check: Queried Airtable records created within the
-    target timeframe to verify data schema matching.
-  - Dashboard Data Reconciliation: Cross-referenced Airtable records against
-    internal dashboard panels to confirm real-time updates.
+{'-'*100}
+  - Frontend Event Tracking: Monitored user form interactions, field inputs, and exit intents.
+  - Session Identification & Copy Tracking: Gathered active session IDs and timestamped payloads.
+  - Airtable Synchronization Check: Queried Airtable records within the target timeframe.
+  - Dashboard Data Reconciliation: Cross-referenced Airtable records against Clarity dashboard.
 
 3. LEADS THAT ARE NOT FOUND IN AIRTABLE (Dashboard vs Airtable Comparison)
-{'-' * 100}
-{leads_table}
-4. Data Summary
-{'-' * 100}
-  Airtable Total Forms:            {airtable_count}
-  Spam (isSpam=true):               {spam_count}
-  Non-spam:                         {non_spam_count}
-  Clarity Total Forms:              {clarity_count}
-  Difference (Clarity - Airtable): {comparison['difference']}
+{'-'*100}
+{lt}
+4. ABANDONED FORMS IN AIRTABLE (with Page URLs)
+{'-'*100}
+{ft}
+5. Data Summary
+{'-'*100}
+  Airtable Total Forms:            {at_count}
+  Spam (isSpam=true):               {spam}
+  Non-spam:                         {at_count - spam}
+  Clarity Total Forms:              {cl_count}
+  Leads NOT in Airtable (from Clarity): {len(not_in_airtable)}
 
-  Airtable Unique IDs:  {comparison.get('airtable_unique_ids', 'N/A')}
-  Clarity Unique IDs:   {comparison.get('clarity_unique_ids', 'N/A')}
-
-5. Data Source Status
-{'-' * 100}
-  Airtable:   {"CONNECTED" if airtable_count > 0 else "NOT RETURNING DATA"} ({airtable_count} records)
-  Clarity:    {"CONNECTED" if clarity_count > 0 else "NOT RETURNING DATA"} ({clarity_count} records)
+6. Data Source Status
+{'-'*100}
+  Airtable:   {"CONNECTED" if at_count>0 else "NOT RETURNING DATA"} ({at_count} records)
+  Clarity:    {"CONNECTED" if cl_count>0 else "NOT RETURNING DATA"} ({cl_count} records)
   Endpoint:   {brand['clarity_base_url']}
 
-6. Airtable Breakdown (by Source)
-{'-' * 100}
-{source_breakdown}
+7. Airtable Breakdown (by Source)
+{'-'*100}
+{sb}
 
-7. Recommendation
-{'-' * 100}
-{recommendation}
+8. Recommendation
+{'-'*100}
+{rec}
 
-{'=' * 100}
-End of Report - {brand_name} QA
-{'=' * 100}
+{'='*100}
+End of Report - {bn} QA
+{'='*100}
 
-Report Generated:   {date_str}
+Report Generated:   {ds}
 Auto-Schedule:      Daily at 9 AM Karachi (cron: 0 4 * * * UTC)
 Generated By:       GitHub Actions Automation
 """
+    fn = f"{brand['code']}_report_{now.strftime('%Y-%m-%d')}.txt"
+    p = os.path.join(OUTPUT_DIR, fn)
+    with open(p, "w", encoding="utf-8") as f: f.write(body)
+    print(f"    Saved: {fn} ({os.path.getsize(p):,} bytes)")
+    return p
 
-    today_str = now.strftime("%Y-%m-%d")
-    txt_filename = f"{brand['code']}_report_{today_str}.txt"
-    out_path = os.path.join(OUTPUT_DIR, txt_filename)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(report_body)
-    print(f"    Saved: {txt_filename} ({os.path.getsize(out_path):,} bytes)")
-    return out_path
-
-
-def generate_all_brand_reports(airtable_records, clarity_records, start_time, end_time):
-    print("\n" + "=" * 60)
-    print("PHASE 3: Generating Brand Reports (TEXT FILES)")
-    print("=" * 60)
-
-    airtable_by_brand = group_airtable_records_by_brand(airtable_records)
-    clarity_by_brand = group_clarity_records_by_brand(clarity_records)
-
-    print(f"\n  Airtable records by brand:")
-    for brand in BRANDS:
-        print(f"    {brand['name']}: {len(airtable_by_brand[brand['name']])} records")
-    print(f"    Unknown: {len(airtable_by_brand['Unknown'])} records")
-
-    print(f"\n  Clarity records by brand:")
-    for brand in BRANDS:
-        print(f"    {brand['name']}: {len(clarity_by_brand[brand['name']])} records")
-
-    report_paths = []
-    for brand in BRANDS:
-        brand_name = brand["name"]
-        brand_airtable = airtable_by_brand[brand_name]
-        brand_clarity = clarity_by_brand[brand_name]
-        print(f"\n  Generating report for: {brand_name}")
-        print(f"    Airtable: {len(brand_airtable)} records")
-        print(f"    Clarity:  {len(brand_clarity)} records")
-        comparison = compare_brand_data(brand_name, brand_airtable, brand_clarity, start_time, end_time)
-        path = generate_brand_text_report(brand, comparison, brand_airtable, brand_clarity, start_time, end_time)
-        report_paths.append(path)
-
-    summary = {
-        "report_date": datetime.now(KARACHI_TZ).isoformat(),
-        "time_window": {"start": start_time.isoformat(), "end": end_time.isoformat()},
-        "total_airtable_records": len(airtable_records),
-        "total_clarity_records": len(clarity_records),
-        "brand_breakdown": {
-            brand["name"]: {
-                "airtable_count": len(airtable_by_brand[brand["name"]]),
-                "clarity_count": len(clarity_by_brand[brand["name"]]),
-            }
-            for brand in BRANDS
-        },
-        "unknown_records": len(airtable_by_brand["Unknown"]),
-        "reports_generated": [os.path.basename(p) for p in report_paths],
-    }
-    summary_path = os.path.join(OUTPUT_DIR, "report_summary.json")
-    with open(summary_path, "w") as f:
+def gen_all(at_recs, cl_recs, start, end):
+    print("\n" + "="*60 + "\nPHASE 3: Generating Reports\n" + "="*60)
+    at_bg = group_airtable(at_recs)
+    cl_bg = group_clarity(cl_recs)
+    print(f"\n  Airtable by brand: " + ", ".join(f"{b['name']}:{len(at_bg[b['name']])}" for b in BRANDS))
+    print(f"  Clarity by brand:  " + ", ".join(f"{b['name']}:{len(cl_bg[b['name']])}" for b in BRANDS))
+    paths = []
+    for b in BRANDS:
+        print(f"\n  Report: {b['name']} (AT:{len(at_bg[b['name']])}, CL:{len(cl_bg[b['name']])})")
+        paths.append(gen_report(b, at_bg[b["name"]], cl_bg[b["name"]], start, end))
+    summary = {"date": datetime.now(KARACHI_TZ).isoformat(), "total_at": len(at_recs), "total_cl": len(cl_recs),
+               "brands": {b["name"]: {"at": len(at_bg[b["name"]]), "cl": len(cl_bg[b["name"]])} for b in BRANDS},
+               "reports": [os.path.basename(p) for p in paths]}
+    with open(os.path.join(OUTPUT_DIR, "report_summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=str)
-    print(f"\n  Summary saved: report_summary.json")
-    return report_paths
-
-
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
+    return paths
 
 def main():
-    print("=" * 60)
-    print("  MULTI-BRAND ABANDONED FORMS REPORT GENERATOR")
+    print("="*60)
+    print("  ABANDONED FORMS REPORT GENERATOR")
     print("  Brands: Quick Signage | Signs.inc | Signage.inc | SignMakerz")
-    print("  Timezone: Asia/Karachi (UTC+5)")
-    print("  Auto-Schedule: Daily 9 AM Karachi (cron: 0 4 * * * UTC)")
-    print("  Output: 4 TEXT FILES (Dashboard vs Airtable Comparison)")
-    print("=" * 60)
-
-    start_time, end_time = get_time_window()
-    print(f"Time window (Karachi): {start_time} -> {end_time}")
-
-    airtable_records = fetch_airtable_data(start_time, end_time)
-    clarity_records = fetch_clarity_data(start_time, end_time)
-    report_paths = generate_all_brand_reports(airtable_records, clarity_records, start_time, end_time)
-
-    print("\n" + "=" * 60)
-    print("  ALL PHASES COMPLETED")
-    print("=" * 60)
-    print(f"\nGenerated {len(report_paths)} brand reports in ./{OUTPUT_DIR}/:")
-    for path in report_paths:
-        size = os.path.getsize(path)
-        print(f"  - {os.path.basename(path)} ({size:,} bytes)")
-
-    print(f"\nAll output files in ./{OUTPUT_DIR}/:")
-    for fname in sorted(os.listdir(OUTPUT_DIR)):
-        fpath = os.path.join(OUTPUT_DIR, fname)
-        if os.path.isfile(fpath):
-            size = os.path.getsize(fpath)
-            print(f"  - {fname} ({size:,} bytes)")
+    print("  Clarity: 4 per-brand URLs | in_airtable field for comparison")
+    print("  Schedule: Daily 9 AM Karachi (cron: 0 4 * * * UTC)")
+    print("="*60)
+    start, end = get_time_window()
+    print(f"Window: {start} -> {end}")
+    at = fetch_airtable(start, end)
+    cl = fetch_clarity(start, end)
+    paths = gen_all(at, cl, start, end)
+    print(f"\n{'='*60}\n  DONE - {len(paths)} reports\n{'='*60}")
+    for p in paths: print(f"  {os.path.basename(p)} ({os.path.getsize(p):,} bytes)")
     return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__": sys.exit(main())
