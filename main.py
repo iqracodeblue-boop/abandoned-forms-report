@@ -56,7 +56,6 @@ def get_airtable_rid(r):
     return str(f.get("Airtable Record ID")) if isinstance(f, dict) and f.get("Airtable Record ID") else rid
 
 def get_clarity_rid(r):
-    """Get Clarity record ID — use uuid (session replay ID)."""
     if not isinstance(r, dict): return None
     for k in ("uuid", "id", "session_id", "sessionId"):
         v = r.get(k)
@@ -80,7 +79,6 @@ def detect_brand(url):
     return "Unknown"
 
 def build_session_url(r, brand):
-    """Build session replay URL using uuid field."""
     uuid = r.get("uuid") if isinstance(r, dict) else None
     if uuid: return f"{brand['clarity_session_base']}{uuid}"
     for f in ("session_url", "url"):
@@ -140,7 +138,6 @@ def fetch_brand_clarity(brand, start, end):
             if resp.status_code != 200:
                 print(f"      Body: {resp.text[:300]}"); break
             data = resp.json()
-            # EXACT structure: {"sessions": {"data": [...], "last_page": N, "current_page": N, "total": N}}
             sessions = data.get("sessions", {})
             records = sessions.get("data", [])
             last_page = sessions.get("last_page", 1)
@@ -172,7 +169,6 @@ def fetch_clarity(start, end):
     for b in BRANDS:
         all_recs.extend(fetch_brand_clarity(b, start, end))
     print(f"\nClarity TOTAL: {len(all_recs)} records")
-    # Filter by date locally (using started_at field)
     filtered = []
     s_utc, e_utc = start.astimezone(UTC_TZ), end.astimezone(UTC_TZ)
     for r in all_recs:
@@ -216,20 +212,17 @@ def group_clarity(recs):
 def gen_report(brand, at_recs, cl_recs, start, end):
     bn = brand["name"]
     at_count = len(at_recs)
-    # Count Clarity records NOT in Airtable (using API's in_airtable field!)
     not_in_airtable = [r for r in cl_recs if isinstance(r, dict) and not r.get("in_airtable", True)]
     cl_count = len(cl_recs)
     now = datetime.now(KARACHI_TZ)
     ds = now.strftime("%d %b %Y, %H:%M (PKT)")
     drh = fmt_date(start, end)
     spam = sum(1 for r in at_recs if str(safe_get(r,"fields",d={}).get("isSpam","")).lower()=="true")
-    # Source breakdown
     sc = {}
     for r in at_recs:
         s = safe_get(r,"fields",d={}).get("Record Source") or "Unknown"
         sc[s] = sc.get(s,0)+1
     sb = "\n".join(f"    {s}: {c}" for s,c in sorted(sc.items(),key=lambda x:-x[1])) if sc else "    (none)"
-    # Section 3: Leads NOT in Airtable (from Clarity, using in_airtable field!)
     if not_in_airtable:
         lt = "+----------------------+--------------------------+----------------------------------------------------+\n"
         lt += "| DATE & TIMESTAMP     | VISITOR / IP             | SESSION REPLAY / VIEW LINK                         |\n"
@@ -245,7 +238,6 @@ def gen_report(brand, at_recs, cl_recs, start, end):
         lt = "    All Clarity records are in Airtable. No missing leads.\n"
     else:
         lt = "    (Clarity API not returning data for this brand.)\n"
-    # Section 4: Abandoned forms in Airtable (with Page URLs)
     if at_recs:
         ft = "+----------------------+--------------------------+----------------------------------------------------+----------+\n"
         ft += "| DATE & TIMESTAMP     | RECORD ID                | PAGE URL                                           | SPAM     |\n"
@@ -261,7 +253,6 @@ def gen_report(brand, at_recs, cl_recs, start, end):
         if len(at_recs)>50: ft += f"\n    ... and {len(at_recs)-50} more\n"
     else:
         ft = "    (No abandoned forms found in Airtable.)\n"
-    # Recommendation
     if at_count==0 and cl_count==0: rec="Both sources returning 0 records."
     elif at_count>0 and cl_count==0: rec=f"Airtable connected ({at_count}), Clarity returning 0.\n  URL: {brand['clarity_base_url']}\n  Token: {CLARITY_API_TOKEN[:12]}...{CLARITY_API_TOKEN[-4:]}"
     elif at_count==0 and cl_count>0: rec=f"Clarity connected ({cl_count}), Airtable returning 0."
