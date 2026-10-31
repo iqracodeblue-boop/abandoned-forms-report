@@ -119,10 +119,10 @@ def fetch_airtable(start, end):
     return recs
 
 
-# === PHASE 2: CLARITY (per-brand, using exact API field names) ===
+# === PHASE 2: CLARITY (MAXIMUM VERBOSE LOGGING) ===
 
 def fetch_brand_clarity(brand, start, end):
-    """Fetch from one brand's Clarity URL. Response: {"sessions": {"data": [...], "last_page": N}}"""
+    """Fetch from one brand's Clarity URL. MAXIMUM verbose logging for debugging."""
     bn, bu = brand["name"], brand["clarity_base_url"]
     print(f"\n  Brand: {bn}")
     print(f"  URL: {bu}")
@@ -133,33 +133,72 @@ def fetch_brand_clarity(brand, start, end):
         params = {"per_page": 25, "api_token": CLARITY_API_TOKEN, "page": page}
         try:
             print(f"    Page {page}: GET {bu}?per_page=25&page={page}")
+            print(f"    Params: per_page=25, api_token={CLARITY_API_TOKEN[:8]}***, page={page}")
             resp = requests.get(bu, params=params, timeout=30)
-            print(f"      HTTP: {resp.status_code}")
+            print(f"      HTTP status: {resp.status_code}")
+            print(f"      Content-Type: {resp.headers.get('Content-Type','?')}")
+
             if resp.status_code != 200:
-                print(f"      Body: {resp.text[:300]}"); break
-            data = resp.json()
+                print(f"      ERROR: HTTP {resp.status_code}")
+                print(f"      Body (500 chars): {resp.text[:500]}")
+                break
+
+            raw_text = resp.text
+            print(f"      Raw response length: {len(raw_text)} chars")
+            print(f"      Raw response (first 300 chars): {raw_text[:300]}")
+
+            try:
+                data = resp.json()
+            except Exception as je:
+                print(f"      JSON PARSE ERROR: {je}")
+                print(f"      Response is NOT JSON!")
+                break
+
+            print(f"      JSON type: {type(data).__name__}")
+            if isinstance(data, dict):
+                print(f"      Top-level keys: {list(data.keys())}")
+
             sessions = data.get("sessions", {})
+            if not sessions:
+                print(f"      WARNING: No 'sessions' key! Trying fallback keys...")
+                for key in ("data", "records", "items", "results"):
+                    if key in data and isinstance(data[key], list):
+                        print(f"      Fallback: Found '{key}' with {len(data[key])} records")
+                        sessions = {"data": data[key], "last_page": 1}
+                        break
+
             records = sessions.get("data", [])
             last_page = sessions.get("last_page", 1)
             total = sessions.get("total", 0)
-            if page == 1:
-                print(f"      Top-level keys: {list(data.keys())}")
-                print(f"      Pagination: last_page={last_page}, total={total}")
-                if records:
-                    print(f"      First record keys: {list(records[0].keys())}")
-                    print(f"      Sample: uuid={records[0].get('uuid')}, entry_url={trunc(str(records[0].get('entry_url','')),60)}, in_airtable={records[0].get('in_airtable')}")
+            print(f"      sessions keys: {list(sessions.keys()) if isinstance(sessions, dict) else 'NOT DICT'}")
+            print(f"      records: {len(records)}, last_page: {last_page}, total: {total}")
+
+            if records and page == 1:
+                print(f"      First record keys: {list(records[0].keys())}")
+                r0 = records[0]
+                print(f"      Sample: uuid={r0.get('uuid')}, started_at={r0.get('started_at')}, in_airtable={r0.get('in_airtable')}")
+                print(f"      entry_url={trunc(str(r0.get('entry_url','')),60)}")
+
             print(f"      Got {len(records)} records (running: {len(brand_recs)+len(records)})")
             for r in records:
                 if isinstance(r, dict): r["_brand"] = bn
             brand_recs.extend(records)
+
             if page >= last_page:
                 print(f"      Reached last page ({page}/{last_page})"); break
             if len(records) < 25:
-                print(f"      Last page reached"); break
+                print(f"      Last page (got {len(records)} < 25)"); break
             page += 1
             if page > 100: print("      Safety limit"); break
+        except requests.exceptions.ConnectionError as ce:
+            print(f"      CONNECTION ERROR: {ce}")
+            break
+        except requests.exceptions.Timeout:
+            print(f"      TIMEOUT: API took >30 seconds")
+            break
         except Exception as e:
-            print(f"      Error: {type(e).__name__}: {e}"); break
+            print(f"      ERROR: {type(e).__name__}: {e}")
+            break
     print(f"  {bn}: {len(brand_recs)} records total")
     return brand_recs
 
